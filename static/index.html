@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CAT - Cyber Activity Tracker</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>CAT</h1>
+        <p>Cyber Activity Tracker</p>
+      </div>
+      <div class="status-strip">
+        <span id="healthStatus">대기</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="input-panel" aria-label="분석 입력">
+        <form id="analysisForm">
+          <div class="panel-title">
+            <h2>분석 요청</h2>
+            <button type="submit" id="analyzeButton">분석 실행</button>
+          </div>
+
+          <label class="file-drop" id="fileDrop">
+            <input id="evtxFiles" name="files" type="file" multiple accept=".evtx,.xml" />
+            <span>EVTX/XML 파일 선택</span>
+            <strong id="fileSummary">선택된 파일 없음</strong>
+          </label>
+
+          <div class="form-grid">
+            <label>
+              <span>시작 시간</span>
+              <input name="start_time" type="datetime-local" />
+            </label>
+            <label>
+              <span>종료 시간</span>
+              <input name="end_time" type="datetime-local" />
+            </label>
+            <label>
+              <span>시간대</span>
+              <input name="timezone" type="text" value="Asia/Seoul" />
+            </label>
+            <label>
+              <span>최대 레코드</span>
+              <input name="max_records" type="number" min="100" max="200000" step="100" value="20000" />
+            </label>
+          </div>
+
+          <div class="lm-row">
+            <label>
+              <span>에이전트</span>
+              <select name="agent_backend" id="agentBackend">
+                <option value="lmstudio" selected>LM Studio Qwen</option>
+                <option value="codex_dev">Codex 개발 검증</option>
+                <option value="rule">규칙 기반</option>
+              </select>
+            </label>
+            <label>
+              <span>LM Studio URL</span>
+              <input name="lm_url" type="url" value="http://172.16.100.51:1234" />
+            </label>
+            <label>
+              <span>모델</span>
+              <input name="lm_model" type="text" value="qwen" />
+            </label>
+          </div>
+        </form>
+      </section>
+
+      <section class="result-panel" aria-label="분석 결과">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="report" type="button">보고서</button>
+          <button class="tab" data-tab="findings" type="button">탐지 결과</button>
+          <button class="tab" data-tab="summary" type="button">요약</button>
+        </div>
+
+        <div id="loading" class="loading hidden">
+          <div class="progress-track">
+            <div id="progressFill" class="progress-fill"></div>
+            <img id="progressCat" class="progress-cat" src="/asset/nyan_cat.gif" alt="" />
+          </div>
+          <span id="loadingText">분석 준비 중</span>
+        </div>
+
+        <div id="errorBox" class="error-box hidden"></div>
+
+        <article id="reportView" class="tab-view markdown-view">
+          <div class="empty-state" aria-hidden="true">
+            <img src="/asset/cat.jpg" alt="" />
+          </div>
+        </article>
+        <article id="findingsView" class="tab-view hidden"></article>
+        <article id="summaryView" class="tab-view hidden"></article>
+      </section>
+    </main>
+
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>

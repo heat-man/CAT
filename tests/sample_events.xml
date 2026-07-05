@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Events>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Security-Auditing" />
+      <EventID>1102</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2026-07-05T10:00:00.000000Z" />
+      <EventRecordID>1001</EventRecordID>
+      <Channel>Security</Channel>
+      <Computer>WIN-CLIENT01</Computer>
+    </System>
+    <EventData>
+      <Data Name="SubjectUserName">admin</Data>
+      <Data Name="SubjectDomainName">CATLAB</Data>
+    </EventData>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Service Control Manager" />
+      <EventID>7045</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2026-07-05T10:03:00.000000Z" />
+      <EventRecordID>2001</EventRecordID>
+      <Channel>System</Channel>
+      <Computer>WIN-CLIENT01</Computer>
+    </System>
+    <EventData>
+      <Data Name="ServiceName">UpdateSvc</Data>
+      <Data Name="ServiceFileName">C:\Users\Public\update.exe</Data>
+      <Data Name="AccountName">LocalSystem</Data>
+    </EventData>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <Provider Name="Microsoft-Windows-Security-Auditing" />
+      <EventID>4688</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2026-07-05T10:05:00.000000Z" />
+      <EventRecordID>1002</EventRecordID>
+      <Channel>Security</Channel>
+      <Computer>WIN-CLIENT01</Computer>
+    </System>
+    <EventData>
+      <Data Name="SubjectUserName">admin</Data>
+      <Data Name="SubjectDomainName">CATLAB</Data>
+      <Data Name="NewProcessName">C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Data>
+      <Data Name="CommandLine">powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand SQBFAFgA</Data>
+      <Data Name="ParentProcessName">C:\Windows\explorer.exe</Data>
+    </EventData>
+  </Event>
+</Events>
