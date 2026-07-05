@@ -35,6 +35,18 @@ def generate_report(
     return _fallback_report(analysis, llm_status["error"]), llm_status
 
 
+def generate_rule_report(analysis: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    status = {
+        "used": True,
+        "backend": "rule",
+        "url": None,
+        "model": "CAT deterministic rules",
+        "error": None,
+        "codex_review_required": False,
+    }
+    return _rule_report(analysis), status
+
+
 def generate_codex_dev_report(analysis: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     status: dict[str, Any] = {
         "used": False,
@@ -224,19 +236,26 @@ def _compact_for_llm(analysis: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fallback_report(analysis: dict[str, Any], llm_error: str | None) -> str:
+    return _rule_report(analysis, llm_error)
+
+
+def _rule_report(analysis: dict[str, Any], llm_error: str | None = None) -> str:
     scope = analysis.get("scope", {})
     summary = analysis.get("summary", {})
     findings = analysis.get("findings", [])
     parser = analysis.get("parser", {})
+    severity_counts = _count_values(findings, "severity")
+    confidence_counts = _count_values(findings, "confidence")
 
     lines = [
-        "# CAT 침해 로그 분석 보고서",
+        "# CAT 규칙 기반 침해 로그 분석 보고서",
         "",
         "## 1. 분석 범위",
         f"- 시작(UTC): {scope.get('start_utc') or '미지정'}",
         f"- 종료(UTC): {scope.get('end_utc') or '미지정'}",
         f"- 로드 이벤트: {scope.get('records_loaded', 0)}건 / 범위 내 이벤트: {scope.get('records_in_range', 0)}건 / 전체 확인: {scope.get('records_seen', 0)}건",
         f"- 레코드 제한 초과: {'예' if scope.get('truncated') else '아니오'}",
+        "- 보고서 방식: CAT 내장 규칙 엔진 기반. 외부 LLM 호출 없이 탐지 결과와 근거 이벤트만 사용합니다.",
         "",
     ]
     if parser.get("errors"):
@@ -248,6 +267,8 @@ def _fallback_report(analysis: dict[str, Any], llm_error: str | None) -> str:
         [
             "## 2. 핵심 요약",
             f"- 탐지된 이상 활동: {len(findings)}건",
+            f"- 심각도 분포: {_format_distribution(severity_counts)}",
+            f"- 신뢰도 분포: {_format_distribution(confidence_counts)}",
             f"- 최초 이벤트: {summary.get('first_seen') or '확인 불가'}",
             f"- 최종 이벤트: {summary.get('last_seen') or '확인 불가'}",
             "",
@@ -293,7 +314,18 @@ def _fallback_report(analysis: dict[str, Any], llm_error: str | None) -> str:
     lines.extend(
         [
             "",
-            "## 5. 추가 수집 및 대응 권고",
+            "## 5. 규칙 기반 판정 기준",
+            "- Event ID, provider/channel, 계정, 원본 IP, 프로세스명, 명령줄, 이벤트 빈도 조건을 조합해 이상 활동을 탐지했습니다.",
+            "- 동일 Event ID라도 provider/channel이 다르면 다른 이벤트로 취급합니다.",
+            "- 네트워크 연결, 파일/레지스트리/데이터 변조, 유출 행위는 근거 이벤트에 해당 필드가 있을 때만 관측된 행위로 판단합니다.",
+            "- LLM 추론 없이 결정적 규칙만 사용하므로 설명은 보수적이며, 근거가 부족한 항목은 확인 필요로 남깁니다.",
+            "",
+            "## 6. 규칙 한계 및 추가 확인 필요",
+            "- 로그 수집 정책, 누락 채널, 파서 오류, 레코드 제한으로 탐지 공백이 생길 수 있습니다.",
+            "- 명령줄 감사, PowerShell ScriptBlock, Sysmon, Defender, 방화벽/프록시/EDR 로그가 없으면 실행 행위와 네트워크 행위를 확정하기 어렵습니다.",
+            "- critical/high 항목은 원본 EVTX와 중앙 로그에서 같은 시간대를 재확인하세요.",
+            "",
+            "## 7. 추가 수집 및 대응 권고",
             "- 탐지 항목의 계정, 호스트, 원본 IP를 기준으로 EDR, 방화벽, VPN, 프록시, AD 로그를 같은 시간대에서 교차 확인하세요.",
             "- 4624/4625/4648/4672/4688/7045/4698/1102 이벤트 간 시간적 연결을 우선적으로 확인하세요.",
             "- 의심 명령줄에 포함된 파일 경로, 해시, 서비스명, 작업명을 IOC 후보로 정리하고 전사 검색하세요.",
@@ -306,6 +338,23 @@ def _format_counter(items: list[dict[str, Any]]) -> list[str]:
     if not items:
         return ["- 없음"]
     return [f"- {item.get('value')}: {item.get('count')}건" for item in items[:10]]
+
+
+def _count_values(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _format_distribution(counts: dict[str, int]) -> str:
+    if not counts:
+        return "없음"
+    order = ["critical", "high", "medium", "low", "info", "unknown"]
+    parts = [f"{key} {counts[key]}건" for key in order if key in counts]
+    parts.extend(f"{key} {value}건" for key, value in sorted(counts.items()) if key not in order)
+    return ", ".join(parts)
 
 
 def _format_finding(index: int, finding: dict[str, Any]) -> list[str]:

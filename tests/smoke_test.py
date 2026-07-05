@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 from cat_app.analyzer import analyze_events
 from cat_app.evtx_reader import parse_event_files
 from cat_app.models import EventRecord, ParseResult
-from cat_app.reporting import generate_report
+from cat_app.reporting import generate_report, generate_rule_report
 
 
 def main() -> None:
@@ -59,8 +59,12 @@ def main() -> None:
     assert "wmi_activity" in contextual_rules
 
     report, llm = generate_report(analysis, use_llm=False, lm_url=None, model=None)
-    assert "CAT 침해 로그 분석 보고서" in report
+    assert "CAT 규칙 기반 침해 로그 분석 보고서" in report
     assert llm["used"] is False
+    rule_report, rule_status = generate_rule_report(analysis)
+    assert "보고서 방식: CAT 내장 규칙 엔진 기반" in rule_report
+    assert rule_status["backend"] == "rule"
+    assert rule_status["used"] is True
     print("CAT smoke test passed")
 
 

@@ -24,6 +24,7 @@ from .reporting import (
     DEFAULT_MODEL,
     generate_codex_dev_report,
     generate_report,
+    generate_rule_report,
 )
 from .timeutil import get_timezone, parse_user_datetime
 
@@ -160,6 +161,8 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 )
                 if agent_backend == "codex_dev":
                     report, llm_status = generate_codex_dev_report(analysis)
+                elif agent_backend == "rule":
+                    report, llm_status = generate_rule_report(analysis)
                 else:
                     report, llm_status = generate_report(
                         analysis,

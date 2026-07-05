@@ -47,6 +47,8 @@ LM Studio 연결 확인:
 
 웹 UI의 기본 에이전트는 `LM Studio Qwen`입니다. 실제 운영 단계에서는 LM Studio의 Qwen 모델이 OpenAI 호환 Chat Completions API를 통해 보고서 작성 에이전트 역할을 합니다. 현재 개발 환경에서 `172.16.100.51:1234` 접속이 제한되는 것은 정상 조건이므로, 성능/품질 검증이 필요하면 UI에서 `Codex 개발 검증`을 선택하거나 `CAT_AGENT_BACKEND=codex_dev`로 실행합니다.
 
+`규칙 기반 보고서`를 선택하면 LM Studio/Codex를 호출하지 않고 CAT 내장 규칙 엔진의 탐지 결과만으로 Markdown 보고서를 생성합니다. 이 모드는 LLM 연결 장애 시 대체 보고서로도 사용됩니다.
+
 자세한 내용은 [docs/AGENT_BACKEND.md](docs/AGENT_BACKEND.md)를 참고하세요.
 
 Codex 검증용 산출물 생성:

@@ -168,7 +168,7 @@ function renderReport(markdown, llm) {
       ? `<p><strong>에이전트:</strong> Codex 개발 검증 사용됨${duration}</p>`
       : `<p><strong>에이전트:</strong> Codex 개발 검증 실패 - 규칙 기반 보고서 사용${llm?.error ? ` (${escapeHtml(llm.error)})` : ""}</p>`;
   } else if (llm?.backend === "rule") {
-    status = `<p><strong>에이전트:</strong> 규칙 기반</p>`;
+    status = `<p><strong>에이전트:</strong> 규칙 기반 탐지/보고서 사용됨</p>`;
   } else {
     status = llm?.used
       ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})</p>`
@@ -323,7 +323,13 @@ function startProgress() {
       percent = Math.min(70, 25 + elapsed * 1.5);
     }
     if (elapsed > 20) {
-      message = agentBackend?.value === "codex_dev" ? "Codex 에이전트 보고서 생성 중" : "보고서 생성 중";
+      if (agentBackend?.value === "codex_dev") {
+        message = "Codex 에이전트 보고서 생성 중";
+      } else if (agentBackend?.value === "rule") {
+        message = "규칙 기반 보고서 생성 중";
+      } else {
+        message = "LM Studio 보고서 생성 중";
+      }
       percent = Math.min(92, 55 + elapsed * 0.8);
     }
     updateProgress(percent, `${message} (${elapsed}초)`);
