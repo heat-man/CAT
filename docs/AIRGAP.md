@@ -31,8 +31,17 @@ Git 저장소 전체를 복사합니다. 단, `.venv`, `__pycache__`, `.pytest_c
 
 ## 최초 설치
 
+Linux/macOS:
+
 ```bash
 ./scripts/bootstrap_offline.sh
+```
+
+Windows PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\bootstrap_offline.ps1
 ```
 
 이 명령은 다음을 수행합니다.
@@ -43,22 +52,46 @@ Git 저장소 전체를 복사합니다. 단, `.venv`, `__pycache__`, `.pytest_c
 
 ## 실행
 
+Linux/macOS:
+
 ```bash
 ./scripts/run.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\run.ps1
 ```
 
 기본 주소는 `http://127.0.0.1:8000`입니다.
 
 다른 호스트/포트를 사용하려면 다음처럼 실행합니다.
 
+Linux/macOS:
+
 ```bash
 HOST=0.0.0.0 PORT=8000 ./scripts/run.sh
 ```
 
+Windows PowerShell:
+
+```powershell
+.\scripts\run.ps1 -BindHost 0.0.0.0 -Port 8000
+```
+
 ## LM Studio 연결 확인
+
+Linux/macOS:
 
 ```bash
 .venv/bin/python scripts/check_lmstudio.py
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\check_lmstudio.py
 ```
 
 기본 대상은 `http://172.16.100.51:1234`입니다.
@@ -71,10 +104,25 @@ HOST=0.0.0.0 PORT=8000 ./scripts/run.sh
 ./scripts/run.sh
 ```
 
+Windows PowerShell:
+
+```powershell
+.\scripts\run.ps1
+```
+
 다른 URL을 테스트하려면 다음처럼 실행합니다.
+
+Linux/macOS:
 
 ```bash
 LM_STUDIO_URL=http://172.16.100.51:1234 .venv/bin/python scripts/check_lmstudio.py
+```
+
+Windows PowerShell:
+
+```powershell
+$env:LM_STUDIO_URL = "http://172.16.100.51:1234"
+.\.venv\Scripts\python.exe .\scripts\check_lmstudio.py
 ```
 
 ## wheelhouse 갱신

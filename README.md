@@ -6,9 +6,19 @@ CAT는 Windows EVTX 로그와 분석 대상 시간대를 입력받아 이상 활
 
 인터넷이 없는 독립망에서도 실행할 수 있도록 필요한 wheel 파일을 `vendor/wheels`에 포함합니다.
 
+Linux/macOS:
+
 ```bash
 ./scripts/bootstrap_offline.sh
 ./scripts/run.sh
+```
+
+Windows PowerShell:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\bootstrap_offline.ps1
+.\scripts\run.ps1
 ```
 
 브라우저에서 `http://127.0.0.1:8000`을 엽니다.
@@ -19,10 +29,20 @@ CAT는 Windows EVTX 로그와 분석 대상 시간대를 입력받아 이상 활
 
 환경 변수로 기본값을 바꿀 수 있습니다.
 
+Linux/macOS:
+
 ```bash
 LM_STUDIO_URL=http://172.16.100.51:1234
 LM_STUDIO_MODEL=qwen
 python3 run.py
+```
+
+Windows PowerShell:
+
+```powershell
+$env:LM_STUDIO_URL = "http://172.16.100.51:1234"
+$env:LM_STUDIO_MODEL = "qwen"
+.\scripts\run.ps1
 ```
 
 LM Studio 연결 확인:
@@ -31,9 +51,15 @@ LM Studio 연결 확인:
 .venv/bin/python scripts/check_lmstudio.py
 ```
 
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\check_lmstudio.py
+```
+
 ## 독립망 배포
 
-독립망에서는 Git 저장소 전체를 복사한 뒤 `./scripts/bootstrap_offline.sh`를 실행합니다. 런타임 외부 통신은 LM Studio 주소 `172.16.100.51:1234`만 필요합니다.
+독립망에서는 Git 저장소 전체를 복사한 뒤 Linux/macOS는 `./scripts/bootstrap_offline.sh`, Windows는 `.\scripts\bootstrap_offline.ps1`을 실행합니다. 런타임 외부 통신은 LM Studio 주소 `172.16.100.51:1234`만 필요합니다.
 
 자세한 내용은 [docs/AIRGAP.md](docs/AIRGAP.md)를 참고하세요.
 
