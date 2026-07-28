@@ -55,17 +55,16 @@
               <span>에이전트</span>
               <select name="agent_backend" id="agentBackend">
                 <option value="lmstudio" selected>LM Studio Qwen</option>
-                <option value="codex_dev">Codex 개발 검증</option>
                 <option value="rule">규칙 기반 보고서</option>
               </select>
             </label>
             <label>
               <span>LM Studio URL</span>
-              <input name="lm_url" type="url" value="http://172.16.100.51:1234" />
+              <input name="lm_url" id="lmUrl" type="url" autocomplete="off" readonly />
             </label>
             <label>
               <span>모델</span>
-              <input name="lm_model" type="text" value="qwen" />
+              <input name="lm_model" id="lmModel" type="text" autocomplete="off" />
             </label>
           </div>
         </form>

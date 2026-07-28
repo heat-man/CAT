@@ -10,6 +10,8 @@ const findingsView = document.querySelector("#findingsView");
 const summaryView = document.querySelector("#summaryView");
 const healthStatus = document.querySelector("#healthStatus");
 const agentBackend = document.querySelector("#agentBackend");
+const lmUrl = document.querySelector("#lmUrl");
+const lmModel = document.querySelector("#lmModel");
 const progressFill = document.querySelector("#progressFill");
 const progressCat = document.querySelector("#progressCat");
 const loadingText = document.querySelector("#loadingText");
@@ -28,12 +30,59 @@ async function loadHealth() {
     if (data.max_upload_bytes) {
       maxUploadBytes = data.max_upload_bytes;
     }
-    if (data.default_agent_backend && agentBackend) {
-      agentBackend.value = data.default_agent_backend;
+    configureAgentBackends(data);
+    if (data.lm_studio_url && lmUrl) {
+      lmUrl.value = data.lm_studio_url;
     }
+    if (lmUrl) {
+      lmUrl.readOnly = data.allow_custom_lm_url !== true;
+      lmUrl.title = lmUrl.readOnly
+        ? "운영 모드에서는 서버 환경변수 LM_STUDIO_URL 값을 사용합니다."
+        : "개발 모드에서 사용자 지정 URL이 허용되었습니다.";
+    }
+    if (data.default_model && lmModel) {
+      lmModel.value = data.default_model;
+    }
+    updateAgentFields();
   } catch {
     healthStatus.textContent = "서버 연결 실패";
   }
+}
+
+function configureAgentBackends(data) {
+  if (!agentBackend) return;
+  const supported = new Set(["lmstudio", "rule"]);
+  if (data.codex_dev_enabled === true) {
+    supported.add("codex_dev");
+  }
+  const labels = {
+    lmstudio: "LM Studio Qwen",
+    codex_dev: "Codex 개발 검증",
+    rule: "규칙 기반 보고서",
+  };
+
+  for (const option of [...agentBackend.options]) {
+    if (!supported.has(option.value)) {
+      option.remove();
+    }
+  }
+  for (const backend of ["lmstudio", "codex_dev", "rule"]) {
+    if (supported.has(backend) && !agentBackend.querySelector(`option[value="${backend}"]`)) {
+      const option = document.createElement("option");
+      option.value = backend;
+      option.textContent = labels[backend];
+      agentBackend.append(option);
+    }
+  }
+  if (supported.has(data.default_agent_backend)) {
+    agentBackend.value = data.default_agent_backend;
+  }
+}
+
+function updateAgentFields() {
+  const isLmStudio = agentBackend?.value === "lmstudio";
+  if (lmUrl) lmUrl.disabled = !isLmStudio;
+  if (lmModel) lmModel.disabled = !isLmStudio;
 }
 
 function updateFileSummary() {
@@ -114,10 +163,10 @@ form.addEventListener("submit", async (event) => {
     }
 
     lastReport = data.report_markdown;
-    lastAnalysis = data.analysis;
+    lastAnalysis = resolveAnalysisPayload(data);
     renderReport(lastReport, data.llm);
-    renderFindings(data.analysis.findings || []);
-    renderSummary(data.analysis);
+    renderFindings(lastAnalysis);
+    renderSummary(lastAnalysis);
     activateTab("report");
   } catch (error) {
     showError(error.message);
@@ -127,6 +176,7 @@ form.addEventListener("submit", async (event) => {
 });
 
 fileInput.addEventListener("change", updateFileSummary);
+agentBackend?.addEventListener("change", updateAgentFields);
 
 for (const eventName of ["dragenter", "dragover"]) {
   fileDrop.addEventListener(eventName, (event) => {
@@ -177,12 +227,280 @@ function renderReport(markdown, llm) {
   reportView.innerHTML = `${status}${markdownToHtml(markdown)}`;
 }
 
-function renderFindings(findings) {
-  if (!findings.length) {
-    findingsView.innerHTML = `<p>현재 룰 기준으로 탐지된 이상 활동이 없습니다.</p>`;
-    return;
+function resolveAnalysisPayload(data) {
+  const response = data && typeof data === "object" ? data : {};
+  const analysis =
+    response.analysis &&
+    typeof response.analysis === "object" &&
+    !Array.isArray(response.analysis)
+      ? response.analysis
+      : {};
+  return {
+    ...analysis,
+    suspicious_events: analysis.suspicious_events ?? response.suspicious_events,
+    scenario_candidates: analysis.scenario_candidates ?? response.scenario_candidates,
+    attack_scenarios: analysis.attack_scenarios ?? response.attack_scenarios,
+  };
+}
+
+function renderFindings(analysisOrFindings) {
+  const analysis = Array.isArray(analysisOrFindings)
+    ? { findings: analysisOrFindings }
+    : analysisOrFindings || {};
+  const findings = Array.isArray(analysis.findings)
+    ? analysis.findings.filter((item) => item && typeof item === "object")
+    : [];
+  const suspiciousEvents = Array.isArray(analysis.suspicious_events)
+    ? analysis.suspicious_events.filter((item) => item && typeof item === "object")
+    : [];
+  const canonicalScenarios = Array.isArray(analysis.scenario_candidates)
+    ? analysis.scenario_candidates.filter((item) => item && typeof item === "object")
+    : [];
+  const compatibleScenarios = Array.isArray(analysis.attack_scenarios)
+    ? analysis.attack_scenarios.filter((item) => item && typeof item === "object")
+    : [];
+  const scenarioCandidates = canonicalScenarios.length
+    ? canonicalScenarios
+    : compatibleScenarios;
+
+  let suspiciousHtml = "";
+  if (suspiciousEvents.length) {
+    suspiciousHtml = suspiciousEvents.map(renderSuspiciousEvent).join("");
+  } else if (findings.length) {
+    suspiciousHtml = findings.map(renderFinding).join("");
+  } else {
+    suspiciousHtml = `<p>현재 룰 기준으로 탐지된 의심 이벤트가 없습니다.</p>`;
   }
-  findingsView.innerHTML = `<div class="finding-list">${findings.map(renderFinding).join("")}</div>`;
+
+  const scenarioHtml = scenarioCandidates.length
+    ? scenarioCandidates.map(renderScenarioCandidate).join("")
+    : `<p>연결 근거를 충족하는 2개 이상의 이벤트가 없어 구조화된 공격 시나리오 후보가 없습니다. 개별 의심 이벤트와 보고서 탭을 함께 확인하세요.</p>`;
+
+  findingsView.innerHTML = `${renderDetectionMeta(analysis.detection_meta, analysis.suspicious_event_scope)}
+    <section aria-labelledby="suspiciousEventsTitle">
+      <h2 id="suspiciousEventsTitle">의심 이벤트</h2>
+      <div class="finding-list">${suspiciousHtml}</div>
+    </section>
+    <section aria-labelledby="scenarioCandidatesTitle">
+      <h2 id="scenarioCandidatesTitle">공격 시나리오 후보</h2>
+      <div class="finding-list">${scenarioHtml}</div>
+    </section>`;
+}
+
+function renderSuspiciousEvent(item) {
+  const matchedRules = asList(item.matched_rules).filter(
+    (rule) => rule && typeof rule === "object",
+  );
+  const ruleIds = uniqueText([
+    ...asList(item.rule_ids),
+    ...matchedRules.map((rule) => rule.rule_id),
+  ]);
+  const reasons = uniqueText(
+    [...asList(item.reasons), ...matchedRules.map((rule) => rule.reason)].map(
+      formatReason,
+    ),
+  );
+  const eventRef = item.event_ref || item.event_uid || "-";
+  const severity = item.severity || matchedRules[0]?.severity || "info";
+  const confidence = item.confidence || matchedRules[0]?.confidence || "-";
+
+  return `<section class="finding ${escapeHtml(severity)}">
+    <h3>${escapeHtml(item.title || `이벤트 ${eventRef}`)}</h3>
+    <div class="meta">
+      <span class="pill">${escapeHtml(severity)}</span>
+      <span class="pill">신뢰도 ${escapeHtml(confidence)}</span>
+      <span class="pill">${escapeHtml(eventRef)}</span>
+      <span class="pill">${escapeHtml(item.time || "-")}</span>
+    </div>
+    <p><strong>탐지 규칙:</strong> ${ruleIds.length ? ruleIds.map(escapeHtml).join(", ") : "-"}</p>
+    ${renderValueList("의심 근거", reasons)}
+    <table class="evidence-table">
+      <thead><tr><th>Event ID</th><th>호스트</th><th>계정</th><th>원본 IP</th><th>명령/프로세스</th></tr></thead>
+      <tbody><tr>
+        <td>${escapeHtml(item.event_id || "-")}</td>
+        <td>${escapeHtml(item.host || "-")}</td>
+        <td>${escapeHtml(item.account || "-")}</td>
+        <td>${escapeHtml(item.source_ip || "-")}</td>
+        <td>${escapeHtml(item.command_line || item.process || "-")}</td>
+      </tr></tbody>
+    </table>
+    <p><strong>원본 위치:</strong> ${escapeHtml(item.provider || "-")} / ${escapeHtml(item.channel || "-")} / ${escapeHtml(item.source_file || "-")} / record ${escapeHtml(item.record_id || "-")}</p>
+    ${renderEventFields(item.fields)}
+  </section>`;
+}
+
+function renderScenarioCandidate(scenario) {
+  const stages = Array.isArray(scenario.stages)
+    ? scenario.stages.filter((item) => item && typeof item === "object")
+    : Array.isArray(scenario.steps)
+      ? scenario.steps.filter((item) => item && typeof item === "object")
+      : [];
+  const eventRefs = uniqueText([
+    ...asList(scenario.event_refs),
+    ...asList(scenario.event_uids),
+  ]);
+  const severity = scenario.severity || "info";
+  const stageRows = [...stages]
+    .sort((left, right) => Number(left.order || 0) - Number(right.order || 0))
+    .map((stage) => {
+      const refs = uniqueText([
+        ...asList(stage.event_ref),
+        ...asList(stage.event_uids),
+      ]);
+      return `<tr>
+        <td>${escapeHtml(stage.order || "-")}</td>
+        <td>${escapeHtml(stage.phase || "-")}</td>
+        <td>${escapeHtml(stage.description || stage.label || "-")}</td>
+        <td>${refs.length ? refs.map(escapeHtml).join(", ") : "-"}</td>
+      </tr>`;
+    })
+    .join("");
+  const factValues = asList(scenario.link_reasons).length
+    ? scenario.link_reasons
+    : scenario.observed_facts;
+  const facts = asList(factValues).map(formatScenarioFact);
+  const alternatives = asList(scenario.alternative_explanations).length
+    ? scenario.alternative_explanations
+    : scenario.not_proven;
+
+  return `<section class="finding ${escapeHtml(severity)}">
+    <h3>${escapeHtml(scenario.title || scenario.scenario_id || "공격 시나리오 후보")}</h3>
+    <div class="meta">
+      <span class="pill">${escapeHtml(scenario.scenario_id || "-")}</span>
+      <span class="pill">신뢰도 ${escapeHtml(scenario.confidence || "-")}</span>
+      ${scenario.severity ? `<span class="pill">${escapeHtml(scenario.severity)}</span>` : ""}
+      ${scenario.status ? `<span class="pill">${escapeHtml(scenario.status)}</span>` : ""}
+      ${scenario.correlation_rule_id ? `<span class="pill">${escapeHtml(scenario.correlation_rule_id)}</span>` : ""}
+    </div>
+    <p><strong>연결 이벤트:</strong> ${eventRefs.length ? eventRefs.map(escapeHtml).join(", ") : "-"}</p>
+    <p><strong>가설:</strong> ${escapeHtml(scenario.hypothesis || "-")}</p>
+    ${stageRows ? `<h4>공격 단계</h4>
+      <table class="evidence-table">
+        <thead><tr><th>순서</th><th>단계</th><th>설명</th><th>이벤트 참조</th></tr></thead>
+        <tbody>${stageRows}</tbody>
+      </table>` : ""}
+    ${renderValueList("연결 근거", facts)}
+    ${renderValueList("대안 설명 / 아직 입증되지 않은 사항", alternatives)}
+    ${renderValueList("추가 증거 필요 사항", scenario.evidence_gaps)}
+    ${renderValueList("권장 다음 단계", scenario.recommended_next_steps)}
+    ${renderScenarioEntities(scenario.entities)}
+  </section>`;
+}
+
+function renderDetectionMeta(meta, eventScope) {
+  const safeMeta = meta && typeof meta === "object" ? meta : {};
+  const safeScope = eventScope && typeof eventScope === "object" ? eventScope : {};
+  const eventTotal = safeMeta.suspicious_events_total;
+  const eventIncluded = safeMeta.suspicious_events_included;
+  const scenarioTotal =
+    safeMeta.scenario_candidates_total ?? safeMeta.attack_scenarios_total;
+  const scenarioIncluded =
+    safeMeta.scenario_candidates_included ?? safeMeta.attack_scenarios_included;
+  const parts = [];
+  if (eventTotal !== undefined || eventIncluded !== undefined) {
+    parts.push(`의심 이벤트 ${eventIncluded ?? "-"} / ${eventTotal ?? "-"}`);
+  } else if (safeScope.included_count !== undefined) {
+    const findingCount =
+      safeScope.finding_event_count !== undefined
+        ? ` / finding 근거 집계 ${safeScope.finding_event_count}건`
+        : "";
+    parts.push(`고유 의심 이벤트 ${safeScope.included_count}건${findingCount}`);
+  }
+  if (scenarioTotal !== undefined || scenarioIncluded !== undefined) {
+    parts.push(`공격 시나리오 후보 ${scenarioIncluded ?? "-"} / ${scenarioTotal ?? "-"}`);
+  }
+  const truncated =
+    safeMeta.suspicious_events_truncated === true ||
+    safeMeta.scenario_candidates_truncated === true ||
+    safeMeta.attack_scenarios_truncated === true ||
+    safeScope.evidence_truncated === true;
+  const scopeNote = safeScope.note
+    ? `<p><strong>범위 참고:</strong> ${escapeHtml(safeScope.note)}</p>`
+    : "";
+  const summary = parts.length
+    ? `<p><strong>표시 범위:</strong> ${parts.map(escapeHtml).join(", ")}${truncated ? " (대표 근거만 포함될 수 있음)" : ""}</p>`
+    : "";
+  return `${summary}${scopeNote}`;
+}
+
+function renderScenarioEntities(entities) {
+  if (!entities || typeof entities !== "object" || Array.isArray(entities)) return "";
+  const rows = Object.entries(entities)
+    .filter(([, values]) => asList(values).length)
+    .map(
+      ([name, values]) =>
+        `<tr><td>${escapeHtml(name)}</td><td>${uniqueText(asList(values)).map(escapeHtml).join(", ")}</td></tr>`,
+    )
+    .join("");
+  return rows
+    ? `<h4>관련 엔티티</h4><table class="evidence-table"><tbody>${rows}</tbody></table>`
+    : "";
+}
+
+function renderEventFields(fields) {
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) return "";
+  const entries = Object.entries(fields);
+  if (!entries.length) return "";
+  const rows = entries
+    .map(
+      ([name, value]) =>
+        `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(displayValue(value))}</td></tr>`,
+    )
+    .join("");
+  return `<details>
+    <summary>추가 이벤트 필드 ${entries.length}개</summary>
+    <table class="evidence-table"><tbody>${rows}</tbody></table>
+  </details>`;
+}
+
+function renderValueList(title, values) {
+  const items = uniqueText(asList(values));
+  if (!items.length) return "";
+  return `<h4>${escapeHtml(title)}</h4><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+}
+
+function asList(value) {
+  if (Array.isArray(value)) return value;
+  return value === undefined || value === null || value === "" ? [] : [value];
+}
+
+function uniqueText(values) {
+  return [...new Set(values.map(displayValue).filter(Boolean))];
+}
+
+function formatReason(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return displayValue(value);
+  }
+  const heading = value.title || value.rule_id || "";
+  const detail = value.description || value.reason || "";
+  if (heading && detail && heading !== detail) return `${heading}: ${detail}`;
+  return displayValue(heading || detail || value);
+}
+
+function formatScenarioFact(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return displayValue(value);
+  }
+  const text = value.text || value.description || value.reason || "";
+  const refs = uniqueText([
+    ...asList(value.event_ref),
+    ...asList(value.event_refs),
+    ...asList(value.event_uids),
+  ]);
+  if (text && refs.length) return `${text} (${refs.join(", ")})`;
+  return displayValue(text || value);
+}
+
+function displayValue(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function renderFinding(finding) {

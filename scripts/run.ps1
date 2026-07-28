@@ -21,8 +21,27 @@ $NeedsBootstrap = $false
 if (-not (Test-Path -Path $VenvPython -PathType Leaf)) {
     $NeedsBootstrap = $true
 } else {
-    & $VenvPython -c "import Evtx" *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $RuntimeProbe = @"
+import struct
+import sys
+from importlib.metadata import version
+from zoneinfo import ZoneInfo
+from Evtx.Evtx import Evtx
+import tzdata
+
+if sys.version_info < (3, 9) or struct.calcsize("P") * 8 != 64:
+    raise SystemExit(1)
+if version("hexdump") != "3.3":
+    raise SystemExit(1)
+if version("python-evtx") != "0.8.1":
+    raise SystemExit(1)
+if version("tzdata") != "2026.3":
+    raise SystemExit(1)
+ZoneInfo("Asia/Seoul")
+"@
+    & $VenvPython -c $RuntimeProbe *> $null
+    $probeExitCode = $LASTEXITCODE
+    if ($probeExitCode -ne 0) {
         $NeedsBootstrap = $true
     }
 }
@@ -32,3 +51,7 @@ if ($NeedsBootstrap) {
 }
 
 & $VenvPython (Join-Path $RootDir "run.py") --host $BindHost --port $Port
+$appExitCode = $LASTEXITCODE
+if ($appExitCode -ne 0) {
+    throw "CAT application exited with code $appExitCode."
+}

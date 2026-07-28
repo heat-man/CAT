@@ -16,7 +16,9 @@ import tempfile
 import threading
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
+from . import __version__
 from .analyzer import analyze_events
 from .evtx_reader import parse_event_files
 from .reporting import (
@@ -25,6 +27,7 @@ from .reporting import (
     generate_codex_dev_report,
     generate_report,
     generate_rule_report,
+    normalize_chat_endpoint,
 )
 from .timeutil import get_timezone, parse_user_datetime
 
@@ -32,11 +35,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 DEFAULT_AGENT_BACKEND = os.getenv("CAT_AGENT_BACKEND", "lmstudio")
+ALLOW_CUSTOM_LM_URL = os.getenv("CAT_ALLOW_CUSTOM_LM_URL", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+CODEX_DEV_ENABLED = os.getenv("CAT_ENABLE_CODEX_DEV", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 ANALYSIS_LOCK = threading.Lock()
 
 
 class CATRequestHandler(BaseHTTPRequestHandler):
-    server_version = "CAT/0.1"
+    server_version = f"CAT/{__version__}"
 
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
@@ -47,9 +62,13 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "name": "CAT",
-                    "lm_studio_url": DEFAULT_LM_STUDIO_URL,
+                    "version": __version__,
+                    "lm_studio_url": _configured_lm_endpoint(),
                     "default_model": DEFAULT_MODEL,
-                    "default_agent_backend": DEFAULT_AGENT_BACKEND,
+                    "default_agent_backend": _default_agent_backend(),
+                    "available_agent_backends": _available_agent_backends(),
+                    "allow_custom_lm_url": ALLOW_CUSTOM_LM_URL,
+                    "codex_dev_enabled": CODEX_DEV_ENABLED,
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 }
             )
@@ -103,6 +122,8 @@ class CATRequestHandler(BaseHTTPRequestHandler):
             max_records = _bounded_int(fields.get("max_records"), default=20000, minimum=100, maximum=200000)
             agent_backend = _agent_backend(fields)
             use_llm = agent_backend == "lmstudio"
+            lm_url = _resolve_lm_url(fields) if use_llm else None
+            lm_model = _resolve_lm_model(fields) if use_llm else None
 
             upload_temp = tempfile.TemporaryDirectory(prefix="cat-upload-")
             temp_dir_path = Path(upload_temp.name)
@@ -167,8 +188,8 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                     report, llm_status = generate_report(
                         analysis,
                         use_llm=use_llm,
-                        lm_url=fields.get("lm_url"),
-                        model=fields.get("lm_model"),
+                        lm_url=lm_url,
+                        model=lm_model,
                     )
                     llm_status["backend"] = agent_backend
                     llm_status["codex_review_required"] = False
@@ -363,12 +384,68 @@ def _agent_backend(fields: dict[str, str]) -> str:
         if legacy_use_llm is not None:
             backend = "lmstudio" if legacy_use_llm.lower() in {"1", "true", "yes", "on"} else "rule"
         else:
-            backend = DEFAULT_AGENT_BACKEND
-    if backend in {"codex_dev", "lmstudio", "rule"}:
+            backend = _default_agent_backend()
+    if backend == "codex_dev":
+        if not CODEX_DEV_ENABLED:
+            raise ValueError(
+                "Codex 개발 검증 backend는 운영 모드에서 비활성화되어 있습니다. "
+                "개발 환경에서만 CAT_ENABLE_CODEX_DEV=true로 허용하세요."
+            )
         return backend
-    if DEFAULT_AGENT_BACKEND in {"codex_dev", "lmstudio", "rule"}:
+    if backend in {"lmstudio", "rule"}:
+        return backend
+    return _default_agent_backend()
+
+
+def _available_agent_backends() -> list[str]:
+    backends = ["lmstudio", "rule"]
+    if CODEX_DEV_ENABLED:
+        backends.insert(1, "codex_dev")
+    return backends
+
+
+def _default_agent_backend() -> str:
+    if DEFAULT_AGENT_BACKEND == "codex_dev":
+        return "codex_dev" if CODEX_DEV_ENABLED else "lmstudio"
+    if DEFAULT_AGENT_BACKEND in {"lmstudio", "rule"}:
         return DEFAULT_AGENT_BACKEND
     return "lmstudio"
+
+
+def _configured_lm_endpoint() -> str:
+    return normalize_chat_endpoint(DEFAULT_LM_STUDIO_URL)
+
+
+def _resolve_lm_url(fields: dict[str, str]) -> str:
+    configured = _configured_lm_endpoint()
+    submitted = fields.get("lm_url", "").strip()
+    if not submitted:
+        return configured
+
+    requested = normalize_chat_endpoint(submitted)
+    if not ALLOW_CUSTOM_LM_URL and _canonical_endpoint(requested) != _canonical_endpoint(configured):
+        raise ValueError(
+            "운영 모드에서는 서버에 설정된 LM Studio URL만 사용할 수 있습니다. "
+            "개발 환경에서만 CAT_ALLOW_CUSTOM_LM_URL=true로 임의 URL을 허용하세요."
+        )
+    return requested
+
+
+def _resolve_lm_model(fields: dict[str, str]) -> str:
+    model = (fields.get("lm_model") or DEFAULT_MODEL).strip()
+    if not model:
+        raise ValueError("LM Studio 모델 ID가 비어 있습니다.")
+    if len(model) > 256 or any(ord(character) < 32 for character in model):
+        raise ValueError("LM Studio 모델 ID가 올바르지 않습니다.")
+    return model
+
+
+def _canonical_endpoint(value: str) -> tuple[str, str, int | None, str]:
+    parsed = urlsplit(normalize_chat_endpoint(value))
+    port = parsed.port
+    if port is None:
+        port = 80 if parsed.scheme == "http" else 443
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), port, parsed.path
 
 
 def _existing_asset(*names: str) -> Path:

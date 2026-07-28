@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .models import EventRecord, ParseResult
 from .timeutil import isoformat_utc
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1, "unknown": 0}
+SCENARIO_CORRELATION_WINDOW_SECONDS = 60 * 60
+AUTHENTICATION_BURST_WINDOW_SECONDS = 10 * 60
+FINDING_EVIDENCE_LIMIT = 96
 
 SUSPICIOUS_COMMAND_KEYWORDS = {
     "encoded powershell": ["encodedcommand", " -enc ", "frombase64string"],
@@ -39,7 +43,7 @@ POWERSHELL_KEYWORDS = [
 def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_utc: datetime | None) -> dict[str, Any]:
     records = sorted(
         parse_result.records,
-        key=lambda event: event.time_created or datetime.min.replace(tzinfo=start_utc.tzinfo if start_utc else None),
+        key=lambda event: _event_time_sort_key(event.time_created),
     )
     findings: list[dict[str, Any]] = []
 
@@ -61,7 +65,11 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
         ),
     )
 
+    suspicious_events = _suspicious_events(findings)
+    scenario_candidates = _scenario_candidates(suspicious_events)
+
     return {
+        "analysis_schema_version": 2,
         "scope": {
             "start_utc": isoformat_utc(start_utc),
             "end_utc": isoformat_utc(end_utc),
@@ -73,6 +81,22 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
         "parser": parse_result.to_dict(),
         "summary": _summary(records),
         "findings": findings,
+        "suspicious_events": suspicious_events,
+        "suspicious_event_scope": {
+            "included_count": len(suspicious_events),
+            "finding_event_count": sum(int(finding.get("event_count") or 0) for finding in findings),
+            "per_finding_evidence_limit": FINDING_EVIDENCE_LIMIT,
+            "evidence_truncated": any(
+                int(finding.get("event_count") or 0) > len(finding.get("evidence") or [])
+                for finding in findings
+            ),
+            "note": (
+                "동일 원본 이벤트가 여러 규칙에 탐지되면 하나로 통합합니다. "
+                f"대량 탐지는 finding별 최대 {FINDING_EVIDENCE_LIMIT}개의 "
+                "시간 균형 대표 근거만 포함될 수 있습니다."
+            ),
+        },
+        "scenario_candidates": scenario_candidates,
         "timeline": _timeline(records, findings),
         "sample_events": [_evidence(event) for event in records[:50]],
     }
@@ -86,8 +110,9 @@ def _summary(records: list[EventRecord]) -> dict[str, Any]:
     accounts = Counter(_account(event) for event in records if _account(event))
     source_ips = Counter(_source_ip(event) for event in records if _valid_ip_field(_source_ip(event)))
 
-    first_seen = min((event.time_created for event in records if event.time_created), default=None)
-    last_seen = max((event.time_created for event in records if event.time_created), default=None)
+    timed_records = [event for event in records if event.time_created is not None]
+    first_seen = timed_records[0].time_created if timed_records else None
+    last_seen = timed_records[-1].time_created if timed_records else None
 
     return {
         "first_seen": isoformat_utc(first_seen),
@@ -119,7 +144,7 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "신규 서비스 설치",
             "high",
             "서비스 설치 이벤트는 지속성 확보, 원격 실행 도구, 백도어 배포와 관련될 수 있습니다.",
-            lambda e: _event_id(e) in {"4697", "7045"},
+            _is_service_install_event,
             [
                 "서비스 실행 파일 경로와 서명, 생성 시간을 확인하세요.",
                 "동일 호스트의 4688/Sysmon 1 프로세스 생성 이벤트와 부모 프로세스를 대조하세요.",
@@ -130,7 +155,7 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "예약 작업 생성 또는 변경",
             "high",
             "예약 작업은 지속성 확보와 정기 실행에 자주 사용됩니다.",
-            lambda e: _event_id(e) in {"4698", "4702", "106", "140", "141"},
+            _is_scheduled_task_event,
             [
                 "작업 이름, 실행 계정, 실행 명령, 트리거를 확인하세요.",
                 "작업 등록 직전의 원격 로그온 또는 명령 실행 이벤트를 추적하세요.",
@@ -141,7 +166,7 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "사용자 계정 생성",
             "high",
             "침해 중 신규 로컬/도메인 계정 생성은 지속 접근권 확보 신호일 수 있습니다.",
-            lambda e: _event_id(e) in {"4720"},
+            lambda e: _event_id(e) == "4720" and _is_security_event(e),
             [
                 "생성 주체 계정과 생성된 계정의 정당성을 확인하세요.",
                 "생성 직후 그룹 추가, 로그인 성공, 서비스/작업 등록 여부를 확인하세요.",
@@ -152,7 +177,7 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "계정 활성화 또는 암호 재설정",
             "medium",
             "비활성 계정 활성화나 암호 재설정은 계정 탈취 또는 권한 유지와 연결될 수 있습니다.",
-            lambda e: _event_id(e) in {"4722", "4723", "4724", "4738"},
+            lambda e: _event_id(e) in {"4722", "4723", "4724", "4738"} and _is_security_event(e),
             [
                 "변경 요청자와 대상 계정의 업무상 정당성을 확인하세요.",
                 "변경 이후 첫 로그인 위치와 로그인 유형을 확인하세요.",
@@ -163,7 +188,7 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "권한 그룹 멤버십 변경",
             "critical",
             "관리자 또는 고권한 그룹 멤버십 변경은 권한 상승의 핵심 증거가 될 수 있습니다.",
-            lambda e: _event_id(e) in {"4728", "4732", "4756"},
+            lambda e: _event_id(e) in {"4728", "4732", "4756"} and _is_security_event(e),
             [
                 "추가된 계정, 대상 그룹, 수행 주체를 확인하세요.",
                 "변경 이후 해당 계정의 4624, 4672, 4688 이벤트를 추적하세요.",
@@ -204,15 +229,26 @@ def _single_rule_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
 def _failed_logon_bursts(records: list[EventRecord]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[EventRecord]] = defaultdict(list)
     for event in records:
-        if _event_id(event) != "4625":
+        if _event_id(event) != "4625" or not _is_security_event(event):
             continue
         key = (_account(event) or "unknown", _source_ip(event) or "unknown", event.computer or "unknown")
         groups[key].append(event)
 
+    bursts = []
+    for key, events in groups.items():
+        burst = _largest_event_window(
+            events,
+            AUTHENTICATION_BURST_WINDOW_SECONDS,
+        )
+        if len(burst) >= 5:
+            bursts.append((key, burst))
+
     findings: list[dict[str, Any]] = []
-    for (account, source_ip, host), events in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True)[:10]:
-        if len(events) < 5:
-            continue
+    for (account, source_ip, host), events in sorted(
+        bursts,
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )[:10]:
         severity = "high" if len(events) >= 20 else "medium"
         findings.append(
             _finding(
@@ -220,7 +256,7 @@ def _failed_logon_bursts(records: list[EventRecord]) -> list[dict[str, Any]]:
                 f"로그온 실패 반복: {account} / {source_ip} -> {host}",
                 severity,
                 events,
-                "동일 계정/원본/대상 조합에서 반복 실패가 발생했습니다. 비밀번호 추측, 계정 탈취 시도, 잘못된 서비스 자격증명 가능성을 확인해야 합니다.",
+                "동일 계정/원본/대상 조합에서 10분 이내 반복 실패가 발생했습니다. 비밀번호 추측, 계정 탈취 시도, 잘못된 서비스 자격증명 가능성을 확인해야 합니다.",
                 "medium",
                 [
                     "실패 사유(SubStatus/Status)와 정상 업무 시스템 여부를 확인하세요.",
@@ -234,21 +270,32 @@ def _failed_logon_bursts(records: list[EventRecord]) -> list[dict[str, Any]]:
 def _kerberos_ntlm_failure_bursts(records: list[EventRecord]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str], list[EventRecord]] = defaultdict(list)
     for event in records:
-        if _event_id(event) not in {"4771", "4776"}:
+        if _event_id(event) not in {"4771", "4776"} or not _is_security_event(event):
             continue
         groups[(_account(event) or "unknown", _source_ip(event) or event.computer or "unknown")].append(event)
 
+    bursts = []
+    for key, events in groups.items():
+        burst = _largest_event_window(
+            events,
+            AUTHENTICATION_BURST_WINDOW_SECONDS,
+        )
+        if len(burst) >= 10:
+            bursts.append((key, burst))
+
     findings: list[dict[str, Any]] = []
-    for (account, origin), events in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True)[:8]:
-        if len(events) < 10:
-            continue
+    for (account, origin), events in sorted(
+        bursts,
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )[:8]:
         findings.append(
             _finding(
                 "auth_failure_burst",
                 f"Kerberos/NTLM 인증 실패 반복: {account} / {origin}",
                 "medium",
                 events,
-                "Kerberos 또는 NTLM 인증 실패가 반복되었습니다. 계정 잠금 전조, 스프레이, 잘못된 저장 자격증명 가능성이 있습니다.",
+                "Kerberos 또는 NTLM 인증 실패가 10분 이내 반복되었습니다. 계정 잠금 전조, 스프레이, 잘못된 저장 자격증명 가능성이 있습니다.",
                 "medium",
                 [
                     "도메인 컨트롤러 기준 동일 원본의 다른 계정 실패 여부를 확인하세요.",
@@ -263,12 +310,18 @@ def _remote_logon_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     rdp_events = [
         event
         for event in records
-        if _event_id(event) == "4624" and _field(event, "LogonType") == "10" and _valid_ip_field(_source_ip(event))
+        if _event_id(event) == "4624"
+        and _is_security_event(event)
+        and _field(event, "LogonType") == "10"
+        and _valid_ip_field(_source_ip(event))
     ]
     network_events = [
         event
         for event in records
-        if _event_id(event) == "4624" and _field(event, "LogonType") == "3" and _valid_ip_field(_source_ip(event))
+        if _event_id(event) == "4624"
+        and _is_security_event(event)
+        and _field(event, "LogonType") == "3"
+        and _valid_ip_field(_source_ip(event))
     ]
     findings: list[dict[str, Any]] = []
     if rdp_events:
@@ -305,7 +358,7 @@ def _remote_logon_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
 
 
 def _explicit_credential_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
-    events = [event for event in records if _event_id(event) == "4648"]
+    events = [event for event in records if _event_id(event) == "4648" and _is_security_event(event)]
     if not events:
         return []
     return [
@@ -328,7 +381,9 @@ def _privileged_logon_findings(records: list[EventRecord]) -> list[dict[str, Any
     events = [
         event
         for event in records
-        if _event_id(event) == "4672" and (_account(event) or "").lower() not in {"system", "local service", "network service"}
+        if _event_id(event) == "4672"
+        and _is_security_event(event)
+        and (_account(event) or "").lower() not in {"system", "local service", "network service"}
     ]
     if len(events) < 3:
         return []
@@ -351,7 +406,7 @@ def _privileged_logon_findings(records: list[EventRecord]) -> list[dict[str, Any
 def _suspicious_process_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     matched_by_category: dict[str, list[EventRecord]] = defaultdict(list)
     for event in records:
-        if _event_id(event) not in {"1", "4688"}:
+        if not _is_process_creation_event(event):
             continue
         text = f" {_event_text(event).lower()} "
         for category, keywords in SUSPICIOUS_COMMAND_KEYWORDS.items():
@@ -381,8 +436,7 @@ def _suspicious_process_findings(records: list[EventRecord]) -> list[dict[str, A
 def _powershell_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     events: list[EventRecord] = []
     for event in records:
-        provider = (event.provider or "").lower()
-        if _event_id(event) not in {"4103", "4104"} and "powershell" not in provider:
+        if not _is_powershell_event(event):
             continue
         text = _event_text(event).lower()
         if any(keyword in text for keyword in POWERSHELL_KEYWORDS):
@@ -454,6 +508,553 @@ def _timeline(records: list[EventRecord], findings: list[dict[str, Any]]) -> lis
     return sorted(entries, key=lambda item: item.get("time") or "")[:100]
 
 
+def _suspicious_events(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregated: dict[tuple[str, ...], dict[str, Any]] = {}
+    for finding in findings:
+        rule_id = str(finding.get("rule_id") or "unknown")
+        title = str(finding.get("title") or rule_id)
+        description = str(finding.get("description") or title)
+        severity = str(finding.get("severity") or "info")
+        confidence = str(finding.get("confidence") or "unknown")
+        for evidence in finding.get("evidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            key = _evidence_identity(evidence)
+            item = aggregated.get(key)
+            if item is None:
+                item = {
+                    "time": evidence.get("time"),
+                    "source_file": evidence.get("source_file"),
+                    "record_id": evidence.get("record_id"),
+                    "event_id": evidence.get("event_id"),
+                    "provider": evidence.get("provider"),
+                    "channel": evidence.get("channel"),
+                    "host": evidence.get("host"),
+                    "account": evidence.get("account"),
+                    "source_ip": evidence.get("source_ip"),
+                    "process": evidence.get("process"),
+                    "command_line": evidence.get("command_line"),
+                    "fields": dict(evidence.get("fields") or {}),
+                    "severity": severity,
+                    "confidence": confidence,
+                    "rule_ids": [],
+                    "reasons": [],
+                }
+                aggregated[key] = item
+            if SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(str(item["severity"]), 0):
+                item["severity"] = severity
+            if CONFIDENCE_RANK.get(confidence, 0) > CONFIDENCE_RANK.get(str(item["confidence"]), 0):
+                item["confidence"] = confidence
+            if rule_id not in item["rule_ids"]:
+                item["rule_ids"].append(rule_id)
+            reason = {"rule_id": rule_id, "title": title, "description": description}
+            if reason not in item["reasons"]:
+                item["reasons"].append(reason)
+
+    ordered = sorted(
+        aggregated.values(),
+        key=lambda item: (
+            item.get("time") is None,
+            item.get("time") or "",
+            item.get("source_file") or "",
+            _record_sort_key(item.get("record_id")),
+            item.get("event_id") or "",
+        ),
+    )
+    for index, item in enumerate(ordered, start=1):
+        item["event_ref"] = f"EVT-{index:04d}"
+    return ordered
+
+
+def _evidence_identity(evidence: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(evidence.get(key) or "")
+        for key in (
+            "source_file",
+            "record_id",
+            "time",
+            "event_id",
+            "provider",
+            "channel",
+            "host",
+            "account",
+            "process",
+            "command_line",
+        )
+    )
+
+
+def _record_sort_key(value: Any) -> tuple[int, int | str]:
+    text = str(value or "")
+    try:
+        return (0, int(text))
+    except ValueError:
+        return (1, text)
+
+
+def _scenario_candidates(suspicious_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not suspicious_events:
+        return []
+
+    parents = list(range(len(suspicious_events)))
+    edge_reasons: dict[tuple[int, int], list[str]] = {}
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(suspicious_events)):
+        for right in range(left + 1, len(suspicious_events)):
+            reasons = _event_link_reasons(suspicious_events[left], suspicious_events[right])
+            if not reasons:
+                continue
+            edge_reasons[(left, right)] = reasons
+            union(left, right)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(suspicious_events)):
+        groups[find(index)].append(index)
+
+    candidates = []
+    ordered_groups = sorted(
+        groups.values(),
+        key=lambda indexes: (
+            suspicious_events[indexes[0]].get("time") is None,
+            suspicious_events[indexes[0]].get("time") or "",
+            suspicious_events[indexes[0]].get("event_ref") or "",
+        ),
+    )
+    for indexes in ordered_groups:
+        if len(indexes) < 2:
+            continue
+        events = [suspicious_events[index] for index in indexes]
+        events.sort(key=lambda item: (item.get("time") is None, item.get("time") or "", item["event_ref"]))
+        reasons = []
+        index_set = set(indexes)
+        for (left, right), values in edge_reasons.items():
+            if left in index_set and right in index_set:
+                for value in values:
+                    if value not in reasons:
+                        reasons.append(value)
+        stages = [
+            {
+                "order": order,
+                "phase": _scenario_phase(event.get("rule_ids") or []),
+                "event_ref": event["event_ref"],
+                "description": _scenario_stage_description(event),
+            }
+            for order, event in enumerate(events, start=1)
+        ]
+        confidence = _scenario_confidence(events, reasons)
+        phases = []
+        for stage in stages:
+            if stage["phase"] not in phases:
+                phases.append(stage["phase"])
+        unique_rules = {
+            str(rule_id)
+            for event in events
+            for rule_id in event.get("rule_ids") or []
+            if rule_id
+        }
+        # Repeated instances of one detector are useful suspicious events, but
+        # they do not by themselves establish a multi-stage attack scenario.
+        if len(unique_rules) < 2 or len(phases) < 2:
+            continue
+        candidate = {
+            "scenario_id": f"SCN-{len(candidates) + 1:03d}",
+            "title": _scenario_title(events, phases),
+            "confidence": confidence,
+            "event_refs": [event["event_ref"] for event in events],
+            "stages": stages,
+            "link_reasons": reasons,
+            "hypothesis": _scenario_hypothesis(events, phases, confidence),
+            "alternative_explanations": _scenario_alternatives(events),
+            "evidence_gaps": _scenario_evidence_gaps(events),
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+def _event_link_reasons(left: dict[str, Any], right: dict[str, Any]) -> list[str]:
+    left_time = _parse_analysis_time(left.get("time"))
+    right_time = _parse_analysis_time(right.get("time"))
+    if left_time is None or right_time is None:
+        return []
+    delta_seconds = abs((right_time - left_time).total_seconds())
+    if delta_seconds > SCENARIO_CORRELATION_WINDOW_SECONDS:
+        return []
+
+    same_host = bool(left.get("host") and left.get("host") == right.get("host"))
+    cross_host_reason = (
+        None if same_host else _explicit_cross_host_relation(left, right)
+    )
+    if not same_host and not cross_host_reason:
+        # A reused account or process path on different machines is not enough.
+        # Cross-host movement requires an explicit source/target hostname field.
+        return []
+
+    shared_entity_reasons = []
+    minutes = max(1, int(delta_seconds // 60))
+    left_account = str(left.get("account") or "")
+    right_account = str(right.get("account") or "")
+    if (
+        _meaningful_account(left_account)
+        and left_account.casefold() == right_account.casefold()
+    ):
+        shared_entity_reasons.append(f"동일 계정 {left['account']} 사용")
+    if (
+        _valid_ip_field(str(left.get("source_ip") or ""))
+        and left.get("source_ip") == right.get("source_ip")
+    ):
+        shared_entity_reasons.append(f"동일 원본 IP {left['source_ip']} 관측")
+
+    left_fields = left.get("fields") or {}
+    right_fields = right.get("fields") or {}
+    if same_host:
+        left_logon_ids = {
+            _normalized_logon_id(left_fields.get(key))
+            for key in ("SubjectLogonId", "TargetLogonId")
+            if _meaningful_logon_id(left_fields.get(key))
+        }
+        right_logon_ids = {
+            _normalized_logon_id(right_fields.get(key))
+            for key in ("SubjectLogonId", "TargetLogonId")
+            if _meaningful_logon_id(right_fields.get(key))
+        }
+        shared_logon_ids = sorted(left_logon_ids & right_logon_ids)
+        if shared_logon_ids:
+            shared_entity_reasons.append(
+                f"동일 Logon ID {', '.join(shared_logon_ids[:2])} 공유"
+            )
+
+        left_processes = {
+            str(value).casefold()
+            for value in (
+                left.get("process"),
+                left_fields.get("ParentProcessName"),
+                left_fields.get("NewProcessName"),
+            )
+            if value
+        }
+        right_processes = {
+            str(value).casefold()
+            for value in (
+                right.get("process"),
+                right_fields.get("ParentProcessName"),
+                right_fields.get("NewProcessName"),
+            )
+            if value
+        }
+        shared_processes = left_processes & right_processes
+        if shared_processes:
+            shared_entity_reasons.append("동일 또는 부모/자식 프로세스 경로 공유")
+
+    transition_reason = _rule_transition_reason(
+        left.get("rule_ids") or [],
+        right.get("rule_ids") or [],
+    )
+    if (
+        not shared_entity_reasons
+        and not transition_reason
+        and not cross_host_reason
+    ):
+        return []
+
+    reasons = []
+    if same_host:
+        reasons.append(f"동일 호스트 {left['host']}에서 {minutes}분 이내 발생")
+    elif cross_host_reason:
+        reasons.append(cross_host_reason)
+        reasons.append(f"서로 다른 호스트에서 {minutes}분 이내 발생")
+    reasons.extend(shared_entity_reasons)
+    if transition_reason:
+        reasons.append(transition_reason)
+    return reasons
+
+
+def _explicit_cross_host_relation(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> str | None:
+    left_host = str(left.get("host") or "")
+    right_host = str(right.get("host") or "")
+    left_fields = left.get("fields") or {}
+    right_fields = right.get("fields") or {}
+    if not isinstance(left_fields, dict) or not isinstance(right_fields, dict):
+        return None
+
+    for key in ("TargetServerName", "TargetInfo"):
+        if _host_reference_matches(left_fields.get(key), right_host):
+            return (
+                f"{left_host} 이벤트의 {key}가 대상 호스트 "
+                f"{right_host}를 명시함"
+            )
+        if _host_reference_matches(right_fields.get(key), left_host):
+            return (
+                f"{right_host} 이벤트의 {key}가 대상 호스트 "
+                f"{left_host}를 명시함"
+            )
+    if _host_reference_matches(left_fields.get("WorkstationName"), right_host):
+        return (
+            f"{left_host} 이벤트의 WorkstationName이 원본 호스트 "
+            f"{right_host}를 명시함"
+        )
+    if _host_reference_matches(right_fields.get("WorkstationName"), left_host):
+        return (
+            f"{right_host} 이벤트의 WorkstationName이 원본 호스트 "
+            f"{left_host}를 명시함"
+        )
+    return None
+
+
+def _host_reference_matches(value: Any, host: str) -> bool:
+    if not value or not host:
+        return False
+
+    def normalized_candidates(raw: Any) -> set[str]:
+        text = str(raw).strip().lstrip("\\").casefold()
+        if not text or text in {"-", "localhost"}:
+            return set()
+        candidates = {text, text.split(".", 1)[0]}
+        if "/" in text:
+            suffix = text.rsplit("/", 1)[-1].lstrip("\\")
+            candidates.update({suffix, suffix.split(".", 1)[0]})
+        return {item for item in candidates if item}
+
+    return bool(normalized_candidates(value) & normalized_candidates(host))
+
+
+def _rule_transition_reason(left_rules: list[str], right_rules: list[str]) -> str | None:
+    left = set(left_rules)
+    right = set(right_rules)
+    execution_rules = {
+        "suspicious_powershell",
+        "wmi_activity",
+    }
+    defense_rules = {"log_cleared", "defender_detection_or_tamper"}
+    persistence_rules = {
+        "service_installed",
+        "scheduled_task_changed",
+        "account_created",
+        "account_enabled_or_password_reset",
+    }
+    remote_rules = {"rdp_logon", "network_logon_volume", "explicit_credentials"}
+    authentication_rules = {"failed_logon_burst", "auth_failure_burst"}
+    privilege_rules = {"privileged_group_change", "privileged_logon"}
+
+    left_execution = any(
+        rule.startswith("suspicious_process_") or rule in execution_rules
+        for rule in left
+    )
+    right_execution = any(
+        rule.startswith("suspicious_process_") or rule in execution_rules
+        for rule in right
+    )
+    left_defense = bool(left & defense_rules)
+    right_defense = bool(right & defense_rules)
+    left_persistence = bool(left & persistence_rules)
+    right_persistence = bool(right & persistence_rules)
+    left_remote = bool(left & remote_rules)
+    right_remote = bool(right & remote_rules)
+    left_authentication = bool(left & authentication_rules)
+    right_authentication = bool(right & authentication_rules)
+    left_privilege = bool(left & privilege_rules)
+    right_privilege = bool(right & privilege_rules)
+
+    if left_execution and right_defense:
+        return "의심 실행 후 로그 삭제 또는 Defender 탐지·설정 변경 징후가 이어짐"
+    if left_defense and right_execution:
+        return "로그 삭제 또는 Defender 탐지·설정 변경 후 의심 실행 징후가 이어짐"
+    if left_execution and right_persistence:
+        return "의심 실행 후 지속성 변경 징후가 이어짐"
+    if left_persistence and right_execution:
+        return "지속성 변경 후 의심 실행 징후가 이어짐"
+    if left_remote and (right_execution or right_persistence):
+        return "원격 접근 또는 명시적 자격 증명 사용 후 실행·지속성 징후가 이어짐"
+    if (left_execution or left_persistence) and right_remote:
+        return "실행·지속성 징후 후 원격 접근 또는 명시적 자격 증명 사용이 이어짐"
+    if left_authentication and right_remote:
+        return "인증 실패 반복 후 원격 로그인 징후가 이어짐"
+    if left_remote and right_authentication:
+        return "원격 로그인 징후 후 인증 실패 반복이 이어짐"
+    if "account_created" in left and right_privilege:
+        return "계정 생성 후 권한 부여·고권한 사용 징후가 이어짐"
+    if left_privilege and "account_created" in right:
+        return "권한 부여·고권한 사용 후 계정 생성 징후가 이어짐"
+    return None
+
+
+def _parse_analysis_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _meaningful_account(value: Any) -> bool:
+    if not value:
+        return False
+    account = str(value).rsplit("\\", 1)[-1].strip().lower()
+    return account not in {
+        "system",
+        "localsystem",
+        "local system",
+        "localservice",
+        "local service",
+        "networkservice",
+        "network service",
+        "anonymous logon",
+        "-",
+    }
+
+
+def _normalized_logon_id(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _meaningful_logon_id(value: Any) -> bool:
+    logon_id = _normalized_logon_id(value)
+    return bool(logon_id) and logon_id not in {
+        "-",
+        "0",
+        "0x0",
+        "0x3e4",
+        "0x3e5",
+        "0x3e6",
+        "0x3e7",
+    }
+
+
+def _scenario_phase(rule_ids: list[str]) -> str:
+    phase_by_rule = {
+        "log_cleared": "방어 회피",
+        "defender_detection_or_tamper": "악성 활동/방어 회피 확인",
+        "service_installed": "지속성 또는 실행",
+        "scheduled_task_changed": "지속성",
+        "account_created": "지속성",
+        "account_enabled_or_password_reset": "계정 접근 유지",
+        "privileged_group_change": "권한 상승",
+        "failed_logon_burst": "자격 증명 공격 후보",
+        "auth_failure_burst": "자격 증명 공격 후보",
+        "rdp_logon": "원격 접근 또는 측면 이동",
+        "network_logon_volume": "원격 접근 또는 측면 이동",
+        "explicit_credentials": "자격 증명 사용 또는 측면 이동",
+        "privileged_logon": "고권한 세션 활동",
+        "wmi_activity": "실행·측면 이동·지속성 후보",
+        "suspicious_powershell": "실행",
+    }
+    for rule_id in rule_ids:
+        if rule_id in phase_by_rule:
+            return phase_by_rule[rule_id]
+        if rule_id.startswith("suspicious_process_"):
+            category = rule_id.removeprefix("suspicious_process_")
+            return {
+                "credential_access": "자격 증명 접근",
+                "defense_evasion": "방어 회피",
+                "persistence": "지속성",
+                "discovery": "환경 탐색",
+                "download_or_remote_payload": "페이로드 획득 또는 실행 후보",
+            }.get(category, "의심 명령 실행")
+    return "의심 활동"
+
+
+def _scenario_stage_description(event: dict[str, Any]) -> str:
+    reason_titles = [str(reason.get("title")) for reason in event.get("reasons") or [] if reason.get("title")]
+    title = ", ".join(reason_titles[:2]) or "규칙 기반 의심 이벤트"
+    details = [f"Event ID {event.get('event_id') or 'unknown'}", f"host={event.get('host') or '-'}"]
+    if event.get("account"):
+        details.append(f"account={event['account']}")
+    if event.get("source_ip"):
+        details.append(f"src={event['source_ip']}")
+    return f"{title}: {', '.join(details)}"
+
+
+def _scenario_confidence(events: list[dict[str, Any]], link_reasons: list[str]) -> str:
+    unique_rules = {rule for event in events for rule in event.get("rule_ids") or []}
+    direct_reasons = [
+        reason
+        for reason in link_reasons
+        if "Logon ID" in reason or "프로세스" in reason
+    ]
+    has_account = any("동일 계정" in reason for reason in link_reasons)
+    has_source_ip = any("동일 원본 IP" in reason for reason in link_reasons)
+    if len(events) >= 3 and len(unique_rules) >= 3 and (direct_reasons or (has_account and has_source_ip)):
+        return "high"
+    if len(events) >= 2 and len(unique_rules) >= 2 and link_reasons:
+        return "medium"
+    return "low"
+
+
+def _scenario_title(events: list[dict[str, Any]], phases: list[str]) -> str:
+    hosts = sorted({str(event["host"]) for event in events if event.get("host")})
+    target = ", ".join(hosts[:2]) if hosts else "호스트 미상"
+    if len(phases) == 1:
+        return f"{target}의 {phases[0]} 활동 가설"
+    return f"{target}의 {' → '.join(phases[:4])} 연계 가설"
+
+
+def _scenario_hypothesis(events: list[dict[str, Any]], phases: list[str], confidence: str) -> str:
+    refs = ", ".join(str(event["event_ref"]) for event in events)
+    flow = " → ".join(phases) if phases else "의심 활동"
+    return (
+        f"{refs}의 인접 이벤트가 60분 이내의 공통 엔티티 또는 명시적 행위 전이를 통해 연결되어 "
+        f"{flow} 흐름일 가능성이 있습니다. "
+        f"현재 신뢰도는 {confidence}이며, 이는 관측 이벤트에 근거한 가설이지 침해 확정 판정이 아닙니다."
+    )
+
+
+def _scenario_alternatives(events: list[dict[str, Any]]) -> list[str]:
+    hosts = {
+        str(event.get("host"))
+        for event in events
+        if event.get("host")
+    }
+    alternatives = [
+        "승인된 관리자 작업, 소프트웨어 배포 또는 장애 대응 활동일 수 있습니다.",
+    ]
+    if len(hosts) > 1:
+        alternatives.append(
+            "명시적 원본/대상 호스트 필드는 연결되지만, 승인된 원격 관리·배포 활동이 "
+            "서로 다른 호스트에서 관측된 것일 수 있습니다."
+        )
+    else:
+        alternatives.append(
+            "공통 호스트에서 시간상 인접했지만 서로 무관한 정상 이벤트가 우연히 함께 "
+            "관측됐을 수 있습니다."
+        )
+    if any("failed_logon_burst" in (event.get("rule_ids") or []) for event in events):
+        alternatives.append("저장된 자격증명 오류 또는 서비스 계정 암호 불일치로 인증 실패가 반복됐을 수 있습니다.")
+    return alternatives
+
+
+def _scenario_evidence_gaps(events: list[dict[str, Any]]) -> list[str]:
+    gaps = []
+    if any(not event.get("source_ip") for event in events):
+        gaps.append("일부 단계의 원본 IP 또는 네트워크 목적지가 확인되지 않았습니다.")
+    if any(not event.get("process") and not event.get("command_line") for event in events):
+        gaps.append("일부 단계의 프로세스, 부모 프로세스 또는 전체 명령줄이 확인되지 않았습니다.")
+    if any(not event.get("time") for event in events):
+        gaps.append("시각이 없는 이벤트는 다른 단계와 시간 상관분석하지 못했습니다.")
+    gaps.extend(
+        [
+            "EDR의 프로세스 계보, 파일 해시·서명 및 파일 생성 기록을 추가 확인해야 합니다.",
+            "방화벽·프록시·DNS·VPN 로그로 외부 통신과 원격 접근 여부를 교차 검증해야 합니다.",
+        ]
+    )
+    return gaps
+
+
 def _finding(
     rule_id: str,
     title: str,
@@ -463,9 +1064,18 @@ def _finding(
     confidence: str,
     steps: list[str],
 ) -> dict[str, Any]:
-    ordered = sorted(events, key=lambda event: event.time_created or datetime.min)
-    first_seen = min((event.time_created for event in ordered if event.time_created), default=None)
-    last_seen = max((event.time_created for event in ordered if event.time_created), default=None)
+    ordered = sorted(
+        events,
+        key=lambda event: (
+            event.time_created is None,
+            isoformat_utc(event.time_created) or "",
+            event.source_file,
+            _record_sort_key(event.record_id),
+        ),
+    )
+    timed_events = [event for event in ordered if event.time_created is not None]
+    first_seen = timed_events[0].time_created if timed_events else None
+    last_seen = timed_events[-1].time_created if timed_events else None
     return {
         "rule_id": rule_id,
         "title": title,
@@ -476,10 +1086,77 @@ def _finding(
         "last_seen": isoformat_utc(last_seen),
         "description": description,
         "entities": _entities(ordered),
-        "evidence": [_evidence(event) for event in ordered[:12]],
+        "evidence": [_evidence(event) for event in _representative_events(ordered)],
         "analysis_guidance": _analysis_guidance(rule_id),
         "recommended_next_steps": steps,
     }
+
+
+def _representative_events(
+    events: list[EventRecord],
+    limit: int = FINDING_EVIDENCE_LIMIT,
+) -> list[EventRecord]:
+    """Keep time-balanced evidence, including both ends of a large match set."""
+    if limit <= 0:
+        return []
+    if len(events) <= limit:
+        return list(events)
+    if limit == 1:
+        return [events[0]]
+    indexes = {
+        round(position * (len(events) - 1) / (limit - 1))
+        for position in range(limit)
+    }
+    return [events[index] for index in sorted(indexes)]
+
+
+def _largest_event_window(
+    events: list[EventRecord],
+    window_seconds: int,
+) -> list[EventRecord]:
+    """Return the largest chronological event set contained in one time window."""
+    if window_seconds < 0:
+        return []
+
+    timed_events = []
+    for event in events:
+        if event.time_created is None:
+            continue
+        event_time = event.time_created
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        else:
+            event_time = event_time.astimezone(timezone.utc)
+        timed_events.append((event_time, event))
+
+    timed_events.sort(
+        key=lambda item: (
+            item[0],
+            item[1].source_file,
+            _record_sort_key(item[1].record_id),
+        )
+    )
+    best_start = 0
+    best_end = 0
+    window_start = 0
+    for window_end, (end_time, _) in enumerate(timed_events):
+        while (
+            window_start <= window_end
+            and (end_time - timed_events[window_start][0]).total_seconds()
+            > window_seconds
+        ):
+            window_start += 1
+        if window_end - window_start > best_end - best_start:
+            best_start = window_start
+            best_end = window_end
+
+    if not timed_events:
+        return []
+    return [event for _, event in timed_events[best_start : best_end + 1]]
+
+
+def _event_time_sort_key(value: datetime | None) -> tuple[bool, str]:
+    return (value is None, isoformat_utc(value) or "")
 
 
 def _entities(events: Iterable[EventRecord]) -> dict[str, list[str]]:
@@ -591,11 +1268,60 @@ def _event_id(event: EventRecord) -> str:
 
 
 def _provider(event: EventRecord) -> str:
-    return (event.provider or "").lower()
+    return (event.provider or "").strip().casefold()
 
 
 def _channel(event: EventRecord) -> str:
-    return (event.channel or "").lower()
+    return (event.channel or "").strip().casefold()
+
+
+def _is_security_event(event: EventRecord) -> bool:
+    return (
+        _provider(event) == "microsoft-windows-security-auditing"
+        and _channel(event) == "security"
+    )
+
+
+def _is_service_install_event(event: EventRecord) -> bool:
+    if _event_id(event) == "4697":
+        return _is_security_event(event)
+    if _event_id(event) != "7045":
+        return False
+    return (
+        _provider(event) == "service control manager"
+        and _channel(event) == "system"
+    )
+
+
+def _is_scheduled_task_event(event: EventRecord) -> bool:
+    if _event_id(event) in {"4698", "4702"}:
+        return _is_security_event(event)
+    if _event_id(event) not in {"106", "140", "141"}:
+        return False
+    return (
+        _provider(event) == "microsoft-windows-taskscheduler"
+        and _channel(event) == "microsoft-windows-taskscheduler/operational"
+    )
+
+
+def _is_process_creation_event(event: EventRecord) -> bool:
+    if _event_id(event) == "4688":
+        return _is_security_event(event)
+    if _event_id(event) != "1":
+        return False
+    return (
+        _provider(event) == "microsoft-windows-sysmon"
+        and _channel(event) == "microsoft-windows-sysmon/operational"
+    )
+
+
+def _is_powershell_event(event: EventRecord) -> bool:
+    if _event_id(event) not in {"4103", "4104"}:
+        return False
+    return (
+        _provider(event) == "microsoft-windows-powershell"
+        and _channel(event) == "microsoft-windows-powershell/operational"
+    )
 
 
 def _is_event_log_clear_event(event: EventRecord) -> bool:
@@ -603,11 +1329,18 @@ def _is_event_log_clear_event(event: EventRecord) -> bool:
     provider = _provider(event)
     channel = _channel(event)
     text = _event_text(event).lower()
-    if "wevtutil cl" in text or "clear-eventlog" in text:
+    if (
+        ("wevtutil cl" in text or "clear-eventlog" in text)
+        and _is_process_creation_event(event)
+    ):
         return True
-    if event_id == "1102" and ("security-auditing" in provider or channel == "security"):
+    if event_id == "1102" and _is_security_event(event):
         return True
-    return event_id == "104" and "eventlog" in provider and (channel == "system" or "eventlog" in channel)
+    return (
+        event_id == "104"
+        and provider == "microsoft-windows-eventlog"
+        and channel == "system"
+    )
 
 
 def _is_defender_security_event(event: EventRecord) -> bool:
@@ -615,18 +1348,24 @@ def _is_defender_security_event(event: EventRecord) -> bool:
         return False
     provider = _provider(event)
     channel = _channel(event)
-    return "defender" in provider or "windows defender" in channel
+    return (
+        provider == "microsoft-windows-windows defender"
+        and channel == "microsoft-windows-windows defender/operational"
+    )
 
 
 def _is_wmi_activity_event(event: EventRecord) -> bool:
     text = _event_text(event).lower()
-    if "wmic process call create" in text:
+    if "wmic process call create" in text and _is_process_creation_event(event):
         return True
     if _event_id(event) not in {"5857", "5858", "5859", "5860", "5861"}:
         return False
     provider = _provider(event)
     channel = _channel(event)
-    return "wmi-activity" in provider or "wmi-activity" in channel
+    return (
+        provider == "microsoft-windows-wmi-activity"
+        and channel == "microsoft-windows-wmi-activity/operational"
+    )
 
 
 def _analysis_guidance(rule_id: str) -> dict[str, Any]:
