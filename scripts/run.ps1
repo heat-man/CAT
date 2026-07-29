@@ -39,7 +39,9 @@ if version("tzdata") != "2026.3":
     raise SystemExit(1)
 ZoneInfo("Asia/Seoul")
 "@
-    & $VenvPython -c $RuntimeProbe *> $null
+    # Windows PowerShell 5.1 strips quotes from multiline native-command
+    # arguments. Read the probe from stdin so Python receives it unchanged.
+    $RuntimeProbe | & $VenvPython - *> $null
     $probeExitCode = $LASTEXITCODE
     if ($probeExitCode -ne 0) {
         $NeedsBootstrap = $true

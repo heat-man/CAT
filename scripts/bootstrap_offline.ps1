@@ -51,6 +51,24 @@ function Invoke-SelectedPython {
     }
 }
 
+function Invoke-SelectedPythonScript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Script,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $allArgs = @()
+    $allArgs += $script:PythonPrefixArgs
+    $allArgs += "-"
+    $Script | & $script:PythonCommand @allArgs
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Description failed with exit code $exitCode."
+    }
+}
+
 function Invoke-CheckedNative {
     param(
         [Parameter(Mandatory = $true)]
@@ -62,6 +80,23 @@ function Invoke-CheckedNative {
     )
 
     & $Command @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Description failed with exit code $exitCode."
+    }
+}
+
+function Invoke-CheckedPythonScript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [Parameter(Mandatory = $true)]
+        [string]$Script,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $Script | & $Command -
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         throw "$Description failed with exit code $exitCode."
@@ -80,7 +115,7 @@ if sys.version_info < (3, 9):
 if bits != 64:
     raise SystemExit("CAT requires 64-bit Python on Windows.")
 "@
-Invoke-SelectedPython -Arguments @("-c", $PythonValidation) -Description "Python version/architecture check"
+Invoke-SelectedPythonScript -Script $PythonValidation -Description "Python version/architecture check"
 
 $ShaFile = Join-Path $Wheelhouse "SHA256SUMS"
 if (-not (Test-Path -Path $ShaFile -PathType Leaf)) {
@@ -135,7 +170,7 @@ if (-not (Test-Path -Path $VenvPython -PathType Leaf)) {
     throw "Virtual environment Python was not created: $VenvPython"
 }
 
-Invoke-CheckedNative -Command $VenvPython -Arguments @("-c", $PythonValidation) -Description "Virtual environment Python check"
+Invoke-CheckedPythonScript -Command $VenvPython -Script $PythonValidation -Description "Virtual environment Python check"
 $env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
 $env:PIP_NO_CACHE_DIR = "1"
 $env:PIP_NO_INDEX = "1"
