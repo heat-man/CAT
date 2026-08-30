@@ -504,6 +504,23 @@ select:focus {
   color: var(--muted);
 }
 
+.llm-warning,
+.parser-warning {
+  margin: 10px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid #d7a84b;
+  border-radius: 8px;
+  background: #fff8e7;
+  color: #5d4512;
+  font-size: 13px;
+}
+
+.llm-warning ul,
+.parser-warning ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
 @media (max-width: 980px) {
   .workspace {
     grid-template-columns: 1fr;

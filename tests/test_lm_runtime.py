@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +25,7 @@ from scripts import check_lmstudio
 class _FakeResponse:
     def __init__(self, payload: object) -> None:
         self.body = json.dumps(payload).encode("utf-8")
+        self.offset = 0
 
     def __enter__(self) -> "_FakeResponse":
         return self
@@ -28,12 +34,62 @@ class _FakeResponse:
         return None
 
     def read(self, limit: int = -1) -> bytes:
-        return self.body if limit < 0 else self.body[:limit]
+        if limit < 0:
+            result = self.body[self.offset :]
+            self.offset = len(self.body)
+            return result
+        result = self.body[self.offset : self.offset + limit]
+        self.offset += len(result)
+        return result
+
+    def read1(self, limit: int = -1) -> bytes:
+        return self.read(limit)
+
+
+def _start_one_shot_http_server(
+    responder: Callable[[socket.socket], None],
+) -> tuple[int, threading.Thread, list[BaseException]]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(2.0)
+    port = listener.getsockname()[1]
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                connection.settimeout(2.0)
+                connection.recv(64 * 1024)
+                responder(connection)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return port, thread, errors
 
 
 class LMRuntimeTests(unittest.TestCase):
     base_url = "http://127.0.0.1:1234"
     model_id = "qwen/qwen3.6-35b-a3b"
+
+    def setUp(self) -> None:
+        # These tests preserve the opt-in strict validation contract. The web
+        # runtime defaults to relaxed recovery and is covered separately below.
+        self.strict_validation = mock.patch.object(
+            reporting,
+            "DEFAULT_LM_STRICT_VALIDATION",
+            True,
+        )
+        self.strict_validation.start()
+
+    def tearDown(self) -> None:
+        self.strict_validation.stop()
 
     def test_qwen_payload_auth_and_response_metadata(self) -> None:
         completion = _structured_completion([])
@@ -195,6 +251,29 @@ class LMRuntimeTests(unittest.TestCase):
                 }
             )
 
+    def test_many_leading_thinking_blocks_are_processed_linearly(self) -> None:
+        copied = {"characters": 0}
+
+        class TrackingText(str):
+            def lstrip(self, chars: str | None = None) -> "TrackingText":
+                return TrackingText(super().lstrip(chars))
+
+            def __getitem__(self, key: object) -> object:
+                result = super().__getitem__(key)
+                if isinstance(key, slice):
+                    copied["characters"] += len(result)
+                    return TrackingText(result)
+                return result
+
+        block_count = 10_000
+        content = TrackingText("<think>x</think>\n" * block_count + "final")
+
+        result, removed = reporting._strip_leading_thinking(content)
+
+        self.assertEqual(result, "final")
+        self.assertTrue(removed)
+        self.assertLessEqual(copied["characters"], len(content))
+
     def test_endpoint_validation_and_operating_mode_url_lock(self) -> None:
         self.assertEqual(
             reporting.normalize_chat_endpoint(f"{self.base_url}/v1"),
@@ -222,11 +301,88 @@ class LMRuntimeTests(unittest.TestCase):
         with (
             mock.patch.object(server, "DEFAULT_LM_STUDIO_URL", self.base_url),
             mock.patch.object(server, "ALLOW_CUSTOM_LM_URL", True),
+            mock.patch.object(server, "CUSTOM_LM_ALLOWED_ORIGINS", set()),
         ):
             self.assertEqual(
-                server._resolve_lm_url({"lm_url": "http://127.0.0.1:9"}),
-                "http://127.0.0.1:9/v1/chat/completions",
+                server._resolve_lm_url({"lm_url": "http://127.0.0.2:1234"}),
+                "http://127.0.0.2:1234/v1/chat/completions",
             )
+            for blocked in (
+                "http://127.0.0.1:9",
+                "http://169.254.169.254/latest/meta-data",
+                "http://[::ffff:169.254.169.254]/latest/meta-data",
+                "http://192.168.100.20:1234",
+                "http://8.8.8.8:1234",
+                "http://unapproved.example:1234",
+            ):
+                with self.subTest(blocked=blocked), self.assertRaisesRegex(
+                    ValueError,
+                    "CAT_LM_ALLOWED_ORIGINS",
+                ):
+                    server._resolve_lm_url({"lm_url": blocked})
+
+    def test_custom_origin_configuration_is_exact_and_validated(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CAT_LM_ALLOWED_ORIGINS": (
+                    "http://192.168.100.20:1234,https://lm.internal:5678"
+                )
+            },
+        ):
+            self.assertEqual(
+                server._env_allowed_origins("CAT_LM_ALLOWED_ORIGINS"),
+                {
+                    ("http", "192.168.100.20", 1234),
+                    ("https", "lm.internal", 5678),
+                },
+            )
+
+        for invalid in (
+            "192.168.100.20:1234",
+            "file://192.168.100.20",
+            "http://user:pass@192.168.100.20:1234",
+            "http://192.168.100.20:1234/v1",
+            "http://192.168.100.20:99999",
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch.dict(
+                    os.environ,
+                    {"CAT_LM_ALLOWED_ORIGINS": invalid},
+                ),
+                self.assertRaisesRegex(RuntimeError, "CAT_LM_ALLOWED_ORIGINS"),
+            ):
+                server._env_allowed_origins("CAT_LM_ALLOWED_ORIGINS")
+
+        with (
+            mock.patch.object(server, "DEFAULT_LM_STUDIO_URL", self.base_url),
+            mock.patch.object(server, "ALLOW_CUSTOM_LM_URL", True),
+            mock.patch.object(
+                server,
+                "CUSTOM_LM_ALLOWED_ORIGINS",
+                {("http", "192.168.100.20", 1234)},
+            ),
+        ):
+            self.assertEqual(
+                server._resolve_lm_url({"lm_url": "http://192.168.100.20:1234"}),
+                "http://192.168.100.20:1234/v1/chat/completions",
+            )
+            # An explicit origin does not disable the built-in loopback rule.
+            self.assertEqual(
+                server._resolve_lm_url({"lm_url": "http://127.0.0.2:1234"}),
+                "http://127.0.0.2:1234/v1/chat/completions",
+            )
+            for blocked in (
+                "http://192.168.100.20:5678",
+                "https://192.168.100.20:1234",
+                "http://192.168.100.21:1234",
+            ):
+                with self.subTest(blocked=blocked), self.assertRaisesRegex(
+                    ValueError,
+                    "CAT_LM_ALLOWED_ORIGINS",
+                ):
+                    server._resolve_lm_url({"lm_url": blocked})
 
     def test_invalid_configured_url_fails_during_startup_import(self) -> None:
         environment = os.environ.copy()
@@ -352,16 +508,18 @@ class LMRuntimeTests(unittest.TestCase):
         ordered_refs = [
             event["event_ref"] for event in compact["suspicious_events"]
         ]
-        self.assertEqual(len(included_refs), reporting.MAX_LM_SUSPICIOUS_EVENTS)
-        self.assertTrue({"EVT-0044", "EVT-0045"}.issubset(included_refs))
         self.assertEqual(
-            ordered_refs,
-            [
-                *(f"EVT-{index:04d}" for index in range(1, 39)),
-                "EVT-0044",
-                "EVT-0045",
-            ],
+            len(included_refs),
+            min(45, reporting.MAX_LM_SUSPICIOUS_EVENTS),
         )
+        self.assertTrue({"EVT-0044", "EVT-0045"}.issubset(included_refs))
+        if reporting.MAX_LM_SUSPICIOUS_EVENTS >= 45:
+            self.assertEqual(
+                ordered_refs,
+                [f"EVT-{index:04d}" for index in range(1, 46)],
+            )
+        else:
+            self.assertEqual(ordered_refs[-2:], ["EVT-0044", "EVT-0045"])
         self.assertEqual(
             compact["scenario_candidates"][0]["event_refs"],
             ["EVT-0044", "EVT-0045"],
@@ -806,10 +964,16 @@ class LMRuntimeTests(unittest.TestCase):
             mock.patch.object(reporting, "DEFAULT_LM_USE_PROXY", False),
             mock.patch.object(reporting.request, "build_opener", return_value=opener) as build,
         ):
-            reporting.open_lm_request(req, timeout=2)
+            reporting.open_lm_request(req, timeout=2, deadline=123.0)
         build.assert_called_once()
-        self.assertIsInstance(build.call_args.args[0], reporting.request.ProxyHandler)
-        self.assertIsInstance(build.call_args.args[1], reporting._NoRedirectHandler)
+        direct_handlers = build.call_args.args
+        self.assertIsInstance(direct_handlers[0], reporting.request.ProxyHandler)
+        self.assertEqual(direct_handlers[0].proxies, {})
+        self.assertIsInstance(direct_handlers[1], reporting._DeadlineHTTPHandler)
+        self.assertIsInstance(direct_handlers[2], reporting._DeadlineHTTPSHandler)
+        self.assertIsInstance(direct_handlers[3], reporting._NoRedirectHandler)
+        self.assertEqual(direct_handlers[1]._deadline, 123.0)
+        self.assertEqual(direct_handlers[2]._deadline, 123.0)
         opener.open.assert_called_once_with(req, timeout=2)
 
         proxy_opener = mock.Mock()
@@ -822,15 +986,14 @@ class LMRuntimeTests(unittest.TestCase):
                 return_value=proxy_opener,
             ) as proxy_build,
         ):
-            reporting.open_lm_request(req, timeout=3)
-        self.assertIsInstance(
-            proxy_build.call_args.args[0],
-            reporting.request.ProxyHandler,
-        )
-        self.assertIsInstance(
-            proxy_build.call_args.args[1],
-            reporting._NoRedirectHandler,
-        )
+            reporting.open_lm_request(req, timeout=3, deadline=456.0)
+        proxy_handlers = proxy_build.call_args.args
+        self.assertIsInstance(proxy_handlers[0], reporting.request.ProxyHandler)
+        self.assertIsInstance(proxy_handlers[1], reporting._DeadlineHTTPHandler)
+        self.assertIsInstance(proxy_handlers[2], reporting._DeadlineHTTPSHandler)
+        self.assertIsInstance(proxy_handlers[3], reporting._NoRedirectHandler)
+        self.assertEqual(proxy_handlers[1]._deadline, 456.0)
+        self.assertEqual(proxy_handlers[2]._deadline, 456.0)
         proxy_opener.open.assert_called_once_with(req, timeout=3)
 
     def test_lm_redirects_are_rejected_to_preserve_endpoint_lock(self) -> None:
@@ -849,6 +1012,65 @@ class LMRuntimeTests(unittest.TestCase):
         )
         self.assertIsNone(redirected)
 
+    def test_opener_rejects_redirect_without_following_location(self) -> None:
+        def respond(connection: socket.socket) -> None:
+            connection.sendall(
+                b"HTTP/1.1 302 Found\r\n"
+                b"Location: http://127.0.0.1:9/steal\r\n"
+                b"Content-Length: 15\r\n"
+                b"Connection: close\r\n\r\n"
+                b"redirect denied"
+            )
+
+        port, thread, server_errors = _start_one_shot_http_server(respond)
+        req = reporting.request.Request(f"http://127.0.0.1:{port}/redirect")
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_USE_PROXY", False),
+            self.assertRaisesRegex(RuntimeError, "HTTP 302: redirect denied"),
+        ):
+            reporting._read_lm_response(req, timeout=1.0)
+
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server_errors, [])
+
+    def test_deadline_opener_preserves_http_error_body_for_retry_logic(self) -> None:
+        def respond(connection: socket.socket) -> None:
+            connection.sendall(
+                b"HTTP/1.1 422 Unprocessable Entity\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 30\r\n"
+                b"Connection: close\r\n\r\n"
+                b'{"error":"unsupported format"}'
+            )
+
+        port, thread, server_errors = _start_one_shot_http_server(respond)
+        req = reporting.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=b"{}",
+            method="POST",
+        )
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_USE_PROXY", False),
+            self.assertRaises(reporting.HTTPError) as raised,
+        ):
+            reporting._read_lm_response(
+                req,
+                timeout=1.0,
+                preserve_http_error=True,
+            )
+
+        self.assertEqual(raised.exception.code, 422)
+        detail = reporting._read_http_error_detail(
+            raised.exception,
+            deadline=time.perf_counter() + 1.0,
+            timeout_seconds=1.0,
+        )
+        self.assertEqual(detail, '{"error":"unsupported format"}')
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server_errors, [])
+
     def test_ui_uses_health_defaults_without_exposing_codex_by_default(self) -> None:
         index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -857,6 +1079,8 @@ class LMRuntimeTests(unittest.TestCase):
         self.assertNotIn('<option value="codex_dev"', index)
         self.assertIn("data.lm_studio_url", app)
         self.assertIn("data.default_model", app)
+        self.assertIn("renderParserWarning", app)
+        self.assertIn("입력 파싱 경고", app)
 
     def test_check_script_performs_real_chat_probe(self) -> None:
         models = _FakeResponse({"data": [{"id": self.model_id}]})
@@ -868,7 +1092,11 @@ class LMRuntimeTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
-            mock.patch.object(reporting, "DEFAULT_LM_API_KEY", "probe-token"),
+            mock.patch.multiple(
+                reporting,
+                DEFAULT_LM_API_KEY="probe-token",
+                DEFAULT_LM_STUDIO_URL=self.base_url,
+            ),
             mock.patch.object(
                 reporting,
                 "open_lm_request",
@@ -993,6 +1221,889 @@ class LMRuntimeTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(open_request.call_count, 1)
         self.assertIn("not present in /v1/models", stderr.getvalue())
+
+
+class RelaxedLMRuntimeTests(unittest.TestCase):
+    base_url = "http://127.0.0.1:1234"
+    model_id = "qwen/qwen3.6-35b-a3b"
+
+    def setUp(self) -> None:
+        self.relaxed_validation = mock.patch.object(
+            reporting,
+            "DEFAULT_LM_STRICT_VALIDATION",
+            False,
+        )
+        self.relaxed_validation.start()
+
+    def tearDown(self) -> None:
+        self.relaxed_validation.stop()
+
+    def test_web_runtime_defaults_are_lan_accessible_and_relaxed(self) -> None:
+        environment = os.environ.copy()
+        for name in (
+            "CAT_HOST",
+            "HOST",
+            "CAT_ALLOW_CUSTOM_LM_URL",
+            "CAT_BROWSER_ALLOWED_ORIGINS",
+            "CAT_LM_STRICT_VALIDATION",
+            "LM_STUDIO_URL",
+        ):
+            environment.pop(name, None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json; "
+                    "from cat_app import reporting, server; "
+                    "print(json.dumps({"
+                    "'host': server.DEFAULT_BIND_HOST, "
+                    "'custom': server.ALLOW_CUSTOM_LM_URL, "
+                    "'strict': reporting.DEFAULT_LM_STRICT_VALIDATION, "
+                    "'url': reporting.DEFAULT_LM_STUDIO_URL}))"
+                ),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=True,
+        )
+        defaults = json.loads(completed.stdout)
+        self.assertEqual(defaults["host"], "0.0.0.0")
+        self.assertTrue(defaults["custom"])
+        self.assertFalse(defaults["strict"])
+        self.assertEqual(
+            defaults["url"],
+            "http://127.0.0.1:1234/v1/chat/completions",
+        )
+        run_sh = (ROOT / "scripts" / "run.sh").read_text(encoding="utf-8")
+        run_ps1 = (ROOT / "scripts" / "run.ps1").read_text(encoding="utf-8")
+        self.assertIn("${HOST:-0.0.0.0}", run_sh)
+        self.assertIn('else { "0.0.0.0" }', run_ps1)
+
+    def test_relaxed_mode_repairs_model_differences_and_keeps_canonical_facts(self) -> None:
+        structured = _structured_payload(
+            ["EVT-0001", "EVT-0002"],
+            include_scenario=True,
+        )
+        structured.pop("recommendations")
+        structured["timeline"] = list(reversed(structured["timeline"]))
+        structured["timeline"][0]["time"] = "2099-01-01T00:00:00Z"
+        structured["attack_scenarios"][0]["scenario_id"] = "SCN-999"
+        structured["attack_scenarios"][0]["steps"][0]["observed"] = "invented"
+        structured["related_entities"][0]["value"] = "INVENTED-HOST"
+        content = f"```json\n{json.dumps(structured, ensure_ascii=False)}\n```"
+        completion = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                }
+            ]
+        }
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis_with_suspicious_events(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertFalse(status["structured_report_validated"])
+        self.assertTrue(status["structured_report_recovered"])
+        self.assertTrue(status["validation_warnings"])
+        self.assertIn("응답 보정 안내", report)
+        self.assertIn("SCN-001", report)
+        self.assertNotIn("SCN-999", report)
+        self.assertNotIn("2099-01-01", report)
+        self.assertNotIn("INVENTED-HOST", report)
+        self.assertIn("2026-07-28T01:00:00Z", report)
+
+    def test_relaxed_mode_displays_unstructured_but_complete_output(self) -> None:
+        completion = _completion_with_content(
+            "# LM Studio 분석\n\n- 추가 조사가 필요한 정상 완료 결과"
+        )
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertTrue(status["unstructured_report_used"])
+        self.assertIn("LM Studio 원문", report)
+        self.assertIn("정상 완료 결과", report)
+
+    def test_relaxed_mode_still_rejects_truncated_non_json_output(self) -> None:
+        completion = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "truncated"},
+                    "finish_reason": "length",
+                }
+            ]
+        }
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertFalse(status["used"])
+        self.assertIn("출력 한도에서 잘렸", status["error"])
+        self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_does_not_synthesize_truncated_json_fragment(self) -> None:
+        for finish_reason in (
+            "length",
+            "content_filter",
+            "tool_calls",
+            "cancelled",
+            "error",
+            "failed",
+            "safety",
+            "server_error",
+            "quota_exceeded",
+            "moderation",
+            "rate_limit",
+            "terminated",
+        ):
+            with self.subTest(finish_reason=finish_reason):
+                completion = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"analysis_scope":"부분 응답"}',
+                            },
+                            "finish_reason": finish_reason,
+                        }
+                    ]
+                }
+                with mock.patch.object(
+                    reporting,
+                    "open_lm_request",
+                    return_value=_FakeResponse(completion),
+                ):
+                    report, status = reporting.generate_report(
+                        _analysis(),
+                        use_llm=True,
+                        lm_url=self.base_url,
+                        model=self.model_id,
+                    )
+
+                self.assertFalse(status["used"])
+                self.assertIn("완전한 구조화 보고서", status["error"])
+                self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_repairs_malformed_nested_json_types(self) -> None:
+        structured = _structured_payload(
+            ["EVT-0001", "EVT-0002"],
+            include_scenario=True,
+        )
+        structured["suspicious_events"][0]["event_ref"] = []
+        structured["suspicious_events"][1]["confidence"] = {}
+        structured["attack_scenarios"][0]["steps"] = 1
+        structured["related_entities"][0]["entity_type"] = []
+        completion = _completion_with_content(json.dumps(structured, ensure_ascii=False))
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis_with_suspicious_events(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertTrue(status["structured_report_recovered"])
+        self.assertIn("EVT-0001", report)
+        self.assertIn("SCN-001", report)
+
+    def test_relaxed_mode_rejects_unhashable_finish_reason_and_empty_sections(self) -> None:
+        fragments = (
+            '{"recommendations":[]}',
+            '{"major_findings":[{"event_refs":[123]}]}',
+            '{"attack_scenarios":[{"steps":[null]}]}',
+            '{"related_entities":[{"event_refs":[{}]}]}',
+        )
+        for content in fragments:
+            with self.subTest(content=content):
+                completion = {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": content,
+                            },
+                            "finish_reason": [],
+                        }
+                    ]
+                }
+                with mock.patch.object(
+                    reporting,
+                    "open_lm_request",
+                    return_value=_FakeResponse(completion),
+                ):
+                    report, status = reporting.generate_report(
+                        _analysis(),
+                        use_llm=True,
+                        lm_url=self.base_url,
+                        model=self.model_id,
+                    )
+
+                self.assertFalse(status["used"])
+                self.assertIn("완전한 구조화 보고서", status["error"])
+                self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_requires_retained_model_content_for_recovery(self) -> None:
+        fragments = (
+            '{"suspicious_events":[{"reason":"MODEL-ONLY"}]}',
+            '{"major_findings":[{"title":"MODEL-ONLY"}]}',
+            '{"timeline":[{"description":"MODEL-ONLY"}]}',
+            '{"timeline":[{"event_ref":"EVT-0001","description":"MODEL-ONLY"}]}',
+            '{"attack_scenarios":[{"scenario_id":"SCN-001","title":"MODEL-ONLY"}]}',
+            '{"related_entities":[{"value":"HOST-A"}]}',
+            '{"no_scenario_reason":"nothing linked"}',
+        )
+        for content in fragments:
+            with self.subTest(content=content):
+                completion = {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+                with mock.patch.object(
+                    reporting,
+                    "open_lm_request",
+                    return_value=_FakeResponse(completion),
+                ):
+                    report, status = reporting.generate_report(
+                        _analysis_with_suspicious_events(),
+                        use_llm=True,
+                        lm_url=self.base_url,
+                        model=self.model_id,
+                    )
+
+                self.assertTrue(status["used"], status["error"])
+                self.assertTrue(status["unstructured_report_used"])
+                self.assertFalse(status["structured_report_recovered"])
+                self.assertIn("LM Studio 원문", report)
+
+    def test_relaxed_mode_keeps_substantive_later_duplicates(self) -> None:
+        structured = _structured_payload(
+            ["EVT-0001", "EVT-0002"],
+            include_scenario=True,
+        )
+        substantive_event = dict(structured["suspicious_events"][0])
+        substantive_event["reason"] = "LATER-EVENT-INTERPRETATION"
+        structured["suspicious_events"] = [
+            {
+                "event_ref": "EVT-0001",
+                "reason": "",
+                "confidence": "invalid",
+            },
+            substantive_event,
+            structured["suspicious_events"][1],
+        ]
+        substantive_scenario = dict(structured["attack_scenarios"][0])
+        substantive_scenario["steps"] = [
+            {
+                "event_ref": "EVT-0001",
+                "inference": "LATER-SCENARIO-INTERPRETATION",
+            },
+            {"event_ref": "EVT-0001", "inference": ""},
+        ]
+        structured["attack_scenarios"] = [
+            {
+                "scenario_id": "SCN-001",
+                "event_refs": ["EVT-0001", "EVT-0002"],
+                "steps": [],
+                "limitations": [],
+            },
+            substantive_scenario,
+        ]
+        completion = _completion_with_content(json.dumps(structured, ensure_ascii=False))
+
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis_with_suspicious_events(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertTrue(status["structured_report_recovered"])
+        self.assertIn("LATER-EVENT-INTERPRETATION", report)
+        self.assertIn("LATER-SCENARIO-INTERPRETATION", report)
+
+    def test_nonstandard_numbers_and_lone_surrogates_remain_browser_safe(self) -> None:
+        completion = _structured_completion([])
+        completion["usage"] = {"completion_tokens": float("nan")}
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(completion),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(status["usage"], {"completion_tokens": None})
+        encoded = server._json_bytes(
+            {
+                "report_markdown": report + "\ud800",
+                "nested": {"not_a_number": float("nan")},
+            }
+        )
+        decoded = json.loads(encoded.decode("utf-8"))
+        self.assertTrue(decoded["report_markdown"].endswith("\ud800"))
+        self.assertIsNone(decoded["nested"]["not_a_number"])
+
+    def test_nested_usage_metadata_is_not_copied_into_browser_response(self) -> None:
+        nested: dict[str, object] = {"leaf": "value"}
+        for _ in range(1200):
+            nested = {"nested": nested}
+        completion = _structured_completion([])
+        completion["usage"] = {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "details": nested,
+        }
+
+        content, metadata = reporting.parse_chat_completion(
+            completion,
+            require_stop=False,
+        )
+
+        self.assertTrue(content)
+        self.assertEqual(
+            metadata["usage"],
+            {"prompt_tokens": 10, "completion_tokens": 20},
+        )
+        server._json_bytes({"metadata": metadata})
+
+    def test_nested_finish_reason_is_normalized_before_browser_response(self) -> None:
+        nested: object = "value"
+        for _ in range(1200):
+            nested = [nested]
+        completion = _structured_completion([])
+        completion["choices"][0]["finish_reason"] = nested
+
+        content, metadata = reporting.parse_chat_completion(
+            completion,
+            require_stop=False,
+        )
+
+        self.assertTrue(content)
+        self.assertEqual(metadata["finish_reason"], "<invalid>")
+        self.assertTrue(metadata["completion_incomplete"])
+        server._json_bytes({"metadata": metadata})
+
+    def test_custom_endpoint_does_not_receive_configured_api_key_by_default(self) -> None:
+        with mock.patch.multiple(
+            reporting,
+            DEFAULT_LM_API_KEY="secret-token",
+            DEFAULT_LM_STUDIO_URL=self.base_url,
+            DEFAULT_LM_API_KEY_ALLOWED_ENDPOINTS=(),
+        ):
+            self.assertEqual(
+                reporting._api_key_for_endpoint(self.base_url),
+                "secret-token",
+            )
+            self.assertIsNone(
+                reporting._api_key_for_endpoint("http://192.168.100.20:1234")
+            )
+        with mock.patch.multiple(
+            reporting,
+            DEFAULT_LM_API_KEY="secret-token",
+            DEFAULT_LM_STUDIO_URL="http://LOCALHOST/v1/chat/completions",
+            DEFAULT_LM_API_KEY_ALLOWED_ENDPOINTS=(),
+        ):
+            self.assertEqual(
+                reporting._api_key_for_endpoint("http://localhost:80/v1"),
+                "secret-token",
+            )
+        with mock.patch.multiple(
+            reporting,
+            DEFAULT_LM_API_KEY="secret-token",
+            DEFAULT_LM_STUDIO_URL=self.base_url,
+            DEFAULT_LM_API_KEY_ALLOWED_ENDPOINTS=(
+                "http://192.168.100.20:1234/v1/chat/completions",
+            ),
+        ):
+            self.assertEqual(
+                reporting._api_key_for_endpoint("http://192.168.100.20:1234"),
+                "secret-token",
+            )
+
+    def test_relaxed_mode_retries_when_json_schema_is_not_supported(self) -> None:
+        schema_error = reporting.HTTPError(
+            f"{self.base_url}/v1/chat/completions",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"unsupported response_format"}'),
+        )
+        completion = _structured_completion([])
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            side_effect=[schema_error, _FakeResponse(completion)],
+        ) as open_request:
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(open_request.call_count, 2)
+        retry_request = open_request.call_args_list[1].args[0]
+        retry_payload = json.loads(retry_request.data.decode("utf-8"))
+        self.assertEqual(retry_payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("top_k", retry_payload)
+        self.assertEqual(
+            retry_payload["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+        self.assertTrue(status["validation_warnings"])
+        self.assertIn("Qwen 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_retries_without_response_format_when_needed(self) -> None:
+        first_error = reporting.HTTPError(
+            f"{self.base_url}/v1/chat/completions",
+            400,
+            "Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"unsupported json_schema"}'),
+        )
+        second_error = reporting.HTTPError(
+            f"{self.base_url}/v1/chat/completions",
+            422,
+            "Unprocessable Entity",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"unsupported json_object"}'),
+        )
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            side_effect=[
+                first_error,
+                second_error,
+                _FakeResponse(_structured_completion([])),
+            ],
+        ) as open_request:
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(open_request.call_count, 3)
+        final_request = open_request.call_args_list[2].args[0]
+        final_payload = json.loads(final_request.data.decode("utf-8"))
+        self.assertNotIn("response_format", final_payload)
+        self.assertEqual(
+            final_payload["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+        self.assertGreaterEqual(len(status["validation_warnings"]), 2)
+        self.assertIn("Qwen 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_does_not_retry_a_missing_endpoint(self) -> None:
+        not_found = reporting.HTTPError(
+            f"{self.base_url}/v1/chat/completions",
+            404,
+            "Not Found",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"route not found"}'),
+        )
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            side_effect=not_found,
+        ) as open_request:
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertFalse(status["used"])
+        self.assertEqual(open_request.call_count, 1)
+        self.assertIn("HTTP 404", status["error"])
+        self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+
+    def test_upload_reader_enforces_an_absolute_deadline(self) -> None:
+        handler = object.__new__(server.CATRequestHandler)
+        handler.rfile = mock.Mock()
+        handler.rfile.read1.return_value = b"x"
+        handler.connection = mock.Mock()
+        handler.connection.gettimeout.return_value = None
+        destination = io.BytesIO()
+
+        with (
+            mock.patch.object(server, "DEFAULT_UPLOAD_TIMEOUT_SECONDS", 0.1),
+            mock.patch.object(
+                server,
+                "perf_counter",
+                side_effect=[0.0, 0.01, 0.2],
+            ),
+            self.assertRaisesRegex(server.RequestBodyTimeout, "전체 수신 시간"),
+        ):
+            handler._receive_request_body(2, destination)
+
+        first_timeout = handler.connection.settimeout.call_args_list[0].args[0]
+        self.assertAlmostEqual(first_timeout, 0.09)
+        handler.connection.settimeout.assert_called_with(None)
+        self.assertEqual(destination.getvalue(), b"x")
+
+    def test_header_deadline_closes_only_the_active_header_generation(self) -> None:
+        handler = object.__new__(server.CATRequestHandler)
+        handler._header_timer_lock = threading.Lock()
+        handler._header_timer = None
+        handler._reading_headers = True
+        handler._header_generation = 4
+        handler.close_connection = False
+        handler.connection = mock.Mock()
+
+        handler._expire_header_read(3)
+        self.assertFalse(handler.close_connection)
+        handler.connection.shutdown.assert_not_called()
+
+        handler._expire_header_read(4)
+        self.assertTrue(handler.close_connection)
+        handler.connection.shutdown.assert_called_once_with(socket.SHUT_RD)
+
+    def test_browser_cross_origin_analysis_requests_are_rejected(self) -> None:
+        self.assertTrue(
+            server._browser_request_origin_allowed({"Host": "127.0.0.1:8000"})
+        )
+        self.assertTrue(
+            server._browser_request_origin_allowed(
+                {
+                    "Host": "192.168.100.1:8000",
+                    "Origin": "http://192.168.100.1:8000",
+                    "Sec-Fetch-Site": "same-origin",
+                }
+            )
+        )
+        self.assertTrue(
+            server._browser_request_origin_allowed(
+                {"Host": "cat.internal", "Origin": "http://cat.internal"}
+            )
+        )
+        with mock.patch.object(
+            server,
+            "BROWSER_ALLOWED_ORIGINS",
+            {("https", "cat.internal", 443)},
+        ):
+            self.assertTrue(
+                server._browser_request_origin_allowed(
+                    {
+                        "Host": "127.0.0.1:8000",
+                        "Origin": "https://cat.internal",
+                    }
+                )
+            )
+            self.assertFalse(
+                server._browser_request_origin_allowed(
+                    {
+                        "Host": "cat.internal:443",
+                        "Origin": "http://cat.internal:443",
+                    }
+                )
+            )
+        for headers in (
+            {
+                "Host": "192.168.100.1:8000",
+                "Origin": "https://evil.example",
+            },
+            {
+                "Host": "192.168.100.1:8000",
+                "Origin": "http://192.168.100.1:9000",
+            },
+            {"Host": "cat.internal", "Origin": "https://cat.internal:9443"},
+            {"Host": "192.168.100.1:8000", "Origin": "null"},
+            {
+                "Host": "192.168.100.1:8000",
+                "Sec-Fetch-Site": "cross-site",
+            },
+        ):
+            with self.subTest(headers=headers):
+                self.assertFalse(server._browser_request_origin_allowed(headers))
+
+    def test_response_writer_applies_timeout_and_handles_slow_client(self) -> None:
+        handler = object.__new__(server.CATRequestHandler)
+        handler.connection = mock.Mock()
+        handler.connection.gettimeout.return_value = None
+        handler.wfile = mock.Mock()
+        handler.wfile.write.side_effect = TimeoutError("slow reader")
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.close_connection = False
+
+        with mock.patch.object(
+            server,
+            "DEFAULT_RESPONSE_WRITE_TIMEOUT_SECONDS",
+            7.5,
+        ), redirect_stdout(io.StringIO()):
+            sent = handler._send_bytes(
+                b"payload",
+                status=server.HTTPStatus.OK,
+                content_type="application/json",
+            )
+
+        self.assertFalse(sent)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(
+            handler.connection.settimeout.call_args_list[0].args[0],
+            7.5,
+        )
+        handler.connection.settimeout.assert_called_with(None)
+
+    def test_server_rejects_connections_above_the_thread_cap(self) -> None:
+        httpd = object.__new__(server.CATHTTPServer)
+        httpd._connection_slots = threading.BoundedSemaphore(1)
+        self.assertTrue(httpd._connection_slots.acquire(blocking=False))
+        httpd.shutdown_request = mock.Mock()
+
+        httpd.process_request(mock.sentinel.request, mock.sentinel.address)
+
+        httpd.shutdown_request.assert_called_once_with(mock.sentinel.request)
+
+    def test_streaming_multipart_preserves_binary_boundary_edge_lengths(self) -> None:
+        boundary = b"cat-test-boundary"
+        for payload_size in (65534, 65535, 65536, 131071):
+            with self.subTest(payload_size=payload_size), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                raw_path = temp_path / "raw.multipart"
+                payload = b"A" * payload_size
+                raw_path.write_bytes(
+                    b"--"
+                    + boundary
+                    + b'\r\nContent-Disposition: form-data; name="files"; filename="edge.evtx"'
+                    + b"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                    + payload
+                    + b"\r\n--"
+                    + boundary
+                    + b"--\r\n"
+                )
+
+                fields, files = server._parse_multipart_file(
+                    raw_path,
+                    boundary,
+                    temp_path,
+                )
+
+                self.assertEqual(fields, {})
+                self.assertEqual(len(files), 1)
+                self.assertEqual(files[0]["size"], payload_size)
+                self.assertEqual(Path(files[0]["path"]).read_bytes(), payload)
+
+    def test_lm_response_reader_enforces_absolute_deadline_between_chunks(self) -> None:
+        class Holder:
+            pass
+
+        class DripStream:
+            def __init__(self) -> None:
+                self.fp = Holder()
+                self.fp.raw = Holder()
+                self.fp.raw._sock = mock.Mock()
+
+            def read1(self, _limit: int) -> bytes:
+                return b"x"
+
+        stream = DripStream()
+        with (
+            mock.patch.object(
+                reporting,
+                "perf_counter",
+                side_effect=[0.01, 0.2],
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            reporting._read_stream_with_deadline(
+                stream,
+                limit=2,
+                deadline=0.1,
+            )
+
+        stream.fp.raw._sock.settimeout.assert_called_once()
+        self.assertAlmostEqual(
+            stream.fp.raw._sock.settimeout.call_args.args[0],
+            0.09,
+        )
+
+    def test_lm_response_header_reader_enforces_absolute_deadline(self) -> None:
+        def drip_header(connection: socket.socket) -> None:
+            connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            try:
+                for _ in range(30):
+                    connection.sendall(b"a")
+                    time.sleep(0.05)
+                connection.sendall(
+                    b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                )
+            except OSError:
+                # The deadline watchdog intentionally shuts the client side
+                # down while this synthetic server is still dripping headers.
+                pass
+
+        port, thread, server_errors = _start_one_shot_http_server(drip_header)
+        req = reporting.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=b"{}",
+            method="POST",
+        )
+        started = time.perf_counter()
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_USE_PROXY", False),
+            self.assertRaisesRegex(RuntimeError, "0.15초 제한"),
+        ):
+            reporting._read_lm_response(req, timeout=0.15)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.8)
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server_errors, [])
+
+    def test_https_proxy_connect_headers_share_absolute_deadline(self) -> None:
+        def drip_connect_header(connection: socket.socket) -> None:
+            connection.sendall(
+                b"HTTP/1.1 200 Connection Established\r\nX-Slow: "
+            )
+            try:
+                for _ in range(30):
+                    connection.sendall(b"a")
+                    time.sleep(0.05)
+                connection.sendall(b"\r\n\r\n")
+            except OSError:
+                pass
+
+        port, thread, server_errors = _start_one_shot_http_server(
+            drip_connect_header
+        )
+        req = reporting.request.Request(
+            "https://lm.example.invalid/v1/chat/completions",
+            data=b"{}",
+            method="POST",
+        )
+        started = time.perf_counter()
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_USE_PROXY", True),
+            mock.patch.object(
+                reporting.request,
+                "getproxies",
+                return_value={"https": f"http://127.0.0.1:{port}"},
+            ),
+            mock.patch.object(
+                reporting.request,
+                "proxy_bypass",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(RuntimeError, "0.15초 제한"),
+        ):
+            reporting._read_lm_response(req, timeout=0.15)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.8)
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server_errors, [])
+
+    def test_completed_header_read_disarms_late_deadline_callback(self) -> None:
+        response = mock.Mock()
+
+        class BaseConnection:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.sock = mock.Mock()
+
+            def getresponse(self) -> object:
+                return response
+
+        class DeadlineConnection(
+            reporting._DeadlineConnectionMixin,
+            BaseConnection,
+        ):
+            pass
+
+        class ManualTimer:
+            latest: "ManualTimer | None" = None
+
+            def __init__(
+                self,
+                _interval: float,
+                function: Callable[[], None],
+            ) -> None:
+                self.function = function
+                self.daemon = False
+                self.cancelled = False
+                ManualTimer.latest = self
+
+            def start(self) -> None:
+                return None
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        with (
+            mock.patch.object(reporting, "perf_counter", return_value=0.0),
+            mock.patch.object(reporting.threading, "Timer", ManualTimer),
+        ):
+            connection = DeadlineConnection("localhost", deadline=1.0)
+            returned = connection.getresponse()
+
+        self.assertIs(returned, response)
+        self.assertIsNotNone(ManualTimer.latest)
+        timer = ManualTimer.latest
+        assert timer is not None
+        self.assertTrue(timer.cancelled)
+        timer.function()
+        connection.sock.shutdown.assert_not_called()
+        response.close.assert_not_called()
 
 
 def _completion_with_content(content: str) -> dict[str, object]:

@@ -6,12 +6,12 @@
 
 정상 운용에 필요한 통신은 다음 두 흐름뿐입니다.
 
-- 브라우저 → CAT 웹 서버: 기본 `http://127.0.0.1:8000`
+- 브라우저 → CAT 웹 서버: `http://127.0.0.1:8000` 또는 VM/LAN의 `http://192.168.100.1:8000`
 - CAT 서버 → LM Studio OpenAI 호환 API: 구성한 `LM_STUDIO_URL`
 
 PyPI, GitHub, CDN, npm registry, Codex 서비스는 런타임에 필요하지 않습니다. `CAT_LM_USE_PROXY=false`가 기본이므로 Python 환경 변수와 Windows 시스템 프록시를 우회하고 LM Studio에 직접 연결합니다. 프록시를 반드시 사용해야 할 때만 `CAT_LM_USE_PROXY=true`로 변경하고 해당 프록시를 독립망 허용 목록에 넣습니다.
 
-CAT와 LM Studio가 다른 호스트라면 TCP 1234를 CAT 호스트에서 LM Studio 호스트 방향으로만 허용합니다. HTTP를 쓰면 조사 근거가 평문으로 전송되므로 신뢰할 수 있는 전용 구간을 사용하거나 내부 TLS 종단을 구성합니다.
+CAT 웹 서버는 기본적으로 `0.0.0.0:8000`에 bind합니다. 따라서 VM에 `192.168.100.1`이 실제 할당되어 있으면 loopback과 해당 VM 주소가 같은 서비스에 연결됩니다. CAT는 브라우저의 교차 출처 분석 POST를 거부하지만 자체 인증/TLS는 없으므로 TCP 8000은 승인된 조사 단말 원본으로 제한해야 합니다. HTTPS 역방향 프록시를 사용하면 공개 origin을 `CAT_BROWSER_ALLOWED_ORIGINS=https://cat.internal`처럼 정확히 지정합니다. 이 설정이 있으면 CAT는 브라우저 Origin을 해당 목록과만 비교하므로 프록시가 backend `Host`로 재작성해도 정상 동작합니다. 직접 HTTP 접근도 병행하려면 `http://127.0.0.1:8000,http://192.168.100.1:8000`을 같은 목록에 추가합니다. CAT와 LM Studio가 다른 호스트라면 TCP 1234를 CAT 호스트에서 LM Studio 호스트 방향으로만 허용합니다. HTTP를 쓰면 조사 근거가 평문으로 전송되므로 신뢰할 수 있는 전용 구간을 사용하거나 내부 TLS 종단을 구성합니다.
 
 ## 2. 외부 준비 환경에서 반입할 항목
 
@@ -119,15 +119,19 @@ $env:CAT_LM_USE_PROXY = "false"
 $env:LM_STUDIO_MODEL = "<정확한 /v1/models ID>"
 $env:CAT_AGENT_BACKEND = "lmstudio"
 $env:CAT_ENABLE_CODEX_DEV = "false"
-$env:CAT_ALLOW_CUSTOM_LM_URL = "false"
+$env:CAT_ALLOW_CUSTOM_LM_URL = "true"
+$env:CAT_LM_ALLOWED_ORIGINS = "http://192.168.100.20:1234"
+$env:CAT_LM_STRICT_VALIDATION = "false"
 .\.venv\Scripts\python.exe .\scripts\check_lmstudio.py
 ```
 
-마지막 명령은 CAT의 실제 운영 보고서 생성 함수를 통해 Chat Completions와 strict JSON Schema를 적용합니다. `EVT-0001`과 `EVT-0002`를 순서대로 연결한 2단계 시나리오뿐 아니라 원본 시각·관측값, 참조 무결성, 증거 한계, 9개 고정 보고서 섹션을 모두 확인합니다. 단순 문자열 또는 축약형 schema만 성공한 경우에는 운용 승인을 내리지 않습니다. API 인증을 사용하면 실행 전에 키를 설정합니다.
+마지막 명령은 웹의 완화 모드와 별개로 Chat Completions와 strict JSON Schema 승인 검사를 수행합니다. `EVT-0001`과 `EVT-0002`를 순서대로 연결한 2단계 시나리오뿐 아니라 원본 시각·관측값, 참조 무결성, 증거 한계, 9개 고정 보고서 섹션을 모두 확인합니다. 단순 문자열 또는 축약형 schema만 성공한 경우에는 strict 운용 승인을 내리지 않습니다. API 인증을 사용하면 실행 전에 키를 설정합니다.
 
 ```powershell
 $env:LM_STUDIO_API_KEY = "<내부에서 발급한 키>"
 ```
+
+브라우저에서 바꾼 LM Studio URL은 해당 브라우저에 저장됩니다. 설정된 API key는 서버의 기본 `LM_STUDIO_URL`과 같은 endpoint에만 전달됩니다. 사용자 지정 endpoint에도 키가 필요한 경우에는 그 주소를 `LM_STUDIO_URL`로 설정해 CAT를 재시작하는 방식을 권장합니다. 별도 주소를 유지해야 한다면 신뢰한 전체 URL만 `CAT_LM_API_KEY_ALLOWED_ENDPOINTS`에 지정합니다. 추가 사용자 지정 주소는 `CAT_LM_ALLOWED_ORIGINS`에 `scheme://host:port` 단위로 정확히 명시하며, `CAT_ALLOW_CUSTOM_LM_URL=false`로 주소 필드를 완전히 잠글 수 있습니다.
 
 ## 6. CAT 실행
 
@@ -137,15 +141,15 @@ $env:LM_STUDIO_API_KEY = "<내부에서 발급한 키>"
 .\scripts\run.ps1
 ```
 
-브라우저에서 `http://127.0.0.1:8000`을 열고 health 정보의 endpoint와 모델 ID가 설정값과 같은지 확인합니다. 기본적으로 URL 필드는 읽기 전용이고 Codex 개발 백엔드는 노출되지 않습니다.
+브라우저에서 로컬은 `http://127.0.0.1:8000`, VM/LAN은 `http://192.168.100.1:8000`을 열고 health 정보의 endpoint와 모델 ID가 설정값과 같은지 확인합니다. 두 번째 주소를 사용하려면 VM NIC에 그 주소가 실제 할당되고 방화벽·라우팅이 허용되어야 합니다. 기본적으로 LM Studio URL 필드는 편집할 수 있고 Codex 개발 백엔드는 노출되지 않습니다.
 
-다른 장비에 UI를 제공해야 할 때만 bind를 변경합니다.
+loopback에서만 제공하려면 bind를 명시적으로 제한합니다.
 
 ```powershell
-.\scripts\run.ps1 -BindHost 0.0.0.0 -Port 8000
+.\scripts\run.ps1 -BindHost 127.0.0.1 -Port 8000
 ```
 
-이 경우 Windows 방화벽 원본 IP 제한, 역방향 프록시 인증, TLS, 업로드 로그 접근 통제를 별도로 구성합니다.
+`0.0.0.0` 기본값을 유지할 때는 Windows 방화벽 원본 IP 제한, 역방향 프록시 인증, TLS, 업로드 로그 접근 통제를 별도로 구성합니다. CAT는 느린 업로드가 분석 실행을 무기한 막지 않도록 본문 수신과 multipart 처리를 합쳐 기본 900초(`CAT_UPLOAD_TIMEOUT_SECONDS`, 10~7200초)로 제한합니다. 요청 라인/헤더에는 15초 절대 제한을 적용하고 동시 연결은 32개로 제한합니다. 분석 중에는 다음 업로드를 본문 수신 전에 거부하며, 응답 쓰기는 60초·동시 대용량 응답은 2개로 제한합니다. 관련 값은 `CAT_HTTP_HEADER_TIMEOUT_SECONDS`, `CAT_MAX_CONNECTIONS`, `CAT_RESPONSE_WRITE_TIMEOUT_SECONDS`, `CAT_MAX_LARGE_RESPONSES`로 조정할 수 있습니다. 업로드는 메모리 대신 임시 파일로 스트리밍되며 multipart 분리 중 업로드 크기의 최대 약 2배에 해당하는 임시 디스크 여유가 필요합니다. XML은 스트리밍으로 읽고 파일·이벤트·텍스트·raw XML·깊이·요소 수와 60초 절대 파싱 예산을 적용합니다. EVTX는 레코드 변환 단계 사이마다 같은 누적 예산을 검사합니다. 필요 시 `CAT_XML_MAX_*` 및 `CAT_XML_PARSE_TIMEOUT_SECONDS`를 VM 메모리와 승인 입력 규모에 맞춰 조정합니다. 역방향 프록시의 request/read timeout은 기본 `CAT_LM_TIMEOUT_SECONDS=900`보다 길게 설정해야 LM Studio 완료 후 브라우저 연결이 먼저 끊어지지 않습니다.
 
 ## 7. Windows 독립망 E2E 승인 체크리스트
 
@@ -171,4 +175,7 @@ $env:LM_STUDIO_API_KEY = "<내부에서 발급한 키>"
 - 모델 목록 실패: LM Studio 서버 bind, 포트, 방화벽, API key를 확인합니다.
 - production structured scenario probe 실패: 정확한 모델 ID, 모델 로드 상태, LM Studio 0.4.8 이상, JSON Schema 지원 엔진, timeout을 확인합니다. 오류에 표시된 누락 섹션·이벤트 참조·관측 사실 불일치도 함께 확인합니다.
 - CAT 시작 실패: `LM_STUDIO_URL` scheme/host/port/path 형식과 환경 변수 값을 확인합니다.
-- 300초 timeout: GPU offload, 컨텍스트 길이, 양자화와 `CAT_LM_TIMEOUT_SECONDS`를 성능 승인 범위 안에서 조정합니다.
+- 900초 timeout: GPU offload, 컨텍스트 길이, 양자화와 `CAT_LM_TIMEOUT_SECONDS`를 성능 승인 범위 안에서 조정하고 역방향 프록시 timeout도 함께 확인합니다.
+- 업로드 408 timeout: 클라이언트↔CAT 전송 속도와 프록시 제한을 확인한 뒤 필요할 때만 `CAT_UPLOAD_TIMEOUT_SECONDS`를 승인 범위 안에서 늘립니다.
+- XML 제한 오류: 단일 파일·이벤트 크기, 요소 수/깊이, 파싱 시간을 확인하고 신뢰한 입력에 한해 해당 `CAT_XML_*` 값을 승인 범위 안에서 조정합니다.
+- LM Studio는 완료됐지만 웹에 보정 경고가 표시됨: 경고의 누락 섹션·참조·관측 사실 차이를 확인합니다. CAT는 canonical 사실을 복원하고 모델의 유효한 해석은 유지합니다. 이전 fail-fast 동작이 필요할 때만 `CAT_LM_STRICT_VALIDATION=true`를 사용합니다.

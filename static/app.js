@@ -32,16 +32,18 @@ async function loadHealth() {
     }
     configureAgentBackends(data);
     if (data.lm_studio_url && lmUrl) {
-      lmUrl.value = data.lm_studio_url;
+      lmUrl.value = data.allow_custom_lm_url === true
+        ? readPreference("cat.lm_url") || data.lm_studio_url
+        : data.lm_studio_url;
     }
     if (lmUrl) {
       lmUrl.readOnly = data.allow_custom_lm_url !== true;
       lmUrl.title = lmUrl.readOnly
         ? "운영 모드에서는 서버 환경변수 LM_STUDIO_URL 값을 사용합니다."
-        : "개발 모드에서 사용자 지정 URL이 허용되었습니다.";
+        : "base URL, /v1 또는 전체 chat/completions 주소를 입력할 수 있습니다.";
     }
     if (data.default_model && lmModel) {
-      lmModel.value = data.default_model;
+      lmModel.value = readPreference("cat.lm_model") || data.default_model;
     }
     updateAgentFields();
   } catch {
@@ -156,7 +158,16 @@ form.addEventListener("submit", async (event) => {
       method: "POST",
       body: formData,
     });
-    const data = await response.json();
+    const responseText = await response.text();
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      const detail = responseText.trim().slice(0, 500);
+      throw new Error(
+        `서버가 JSON이 아닌 응답을 반환했습니다 (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+      );
+    }
     if (!response.ok || !data.ok) {
       const parserErrors = data.parser?.errors?.length ? `\n${data.parser.errors.join("\n")}` : "";
       throw new Error(`${data.error || "분석 요청 실패"}${parserErrors}`);
@@ -164,9 +175,17 @@ form.addEventListener("submit", async (event) => {
 
     lastReport = data.report_markdown;
     lastAnalysis = resolveAnalysisPayload(data);
-    renderReport(lastReport, data.llm);
-    renderFindings(lastAnalysis);
-    renderSummary(lastAnalysis);
+    renderReport(lastReport, data.llm, lastAnalysis);
+    try {
+      renderFindings(lastAnalysis);
+    } catch (renderError) {
+      findingsView.innerHTML = `<p>탐지 결과 렌더링 경고: ${escapeHtml(renderError.message)}</p>`;
+    }
+    try {
+      renderSummary(lastAnalysis);
+    } catch (renderError) {
+      summaryView.innerHTML = `<p>요약 렌더링 경고: ${escapeHtml(renderError.message)}</p>`;
+    }
     activateTab("report");
   } catch (error) {
     showError(error.message);
@@ -177,6 +196,8 @@ form.addEventListener("submit", async (event) => {
 
 fileInput.addEventListener("change", updateFileSummary);
 agentBackend?.addEventListener("change", updateAgentFields);
+lmUrl?.addEventListener("change", () => writePreference("cat.lm_url", lmUrl.value.trim()));
+lmModel?.addEventListener("change", () => writePreference("cat.lm_model", lmModel.value.trim()));
 
 for (const eventName of ["dragenter", "dragover"]) {
   fileDrop.addEventListener(eventName, (event) => {
@@ -210,7 +231,7 @@ function activateTab(name) {
   summaryView.classList.toggle("hidden", name !== "summary");
 }
 
-function renderReport(markdown, llm) {
+function renderReport(markdown, llm, analysis = {}) {
   let status = "";
   if (llm?.backend === "codex_dev") {
     const duration = Number.isFinite(llm.duration_seconds) ? ` / ${llm.duration_seconds.toFixed(1)}초` : "";
@@ -220,11 +241,53 @@ function renderReport(markdown, llm) {
   } else if (llm?.backend === "rule") {
     status = `<p><strong>에이전트:</strong> 규칙 기반 탐지/보고서 사용됨</p>`;
   } else {
+    const warnings = Array.isArray(llm?.validation_warnings)
+      ? llm.validation_warnings.filter((item) => typeof item === "string" && item.trim())
+      : [];
     status = llm?.used
-      ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})</p>`
+      ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})${llm.validation_mode === "relaxed" ? " / 완화 검증" : ""}</p>${
+          warnings.length
+            ? `<div class="llm-warning"><strong>응답 보정 안내:</strong><ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
+            : ""
+        }`
       : `<p><strong>에이전트:</strong> LM Studio Qwen 미사용${llm?.error ? ` - ${escapeHtml(llm.error)}` : ""}</p>`;
   }
-  reportView.innerHTML = `${status}${markdownToHtml(markdown)}`;
+  reportView.innerHTML = `${renderParserWarning(analysis)}${status}${markdownToHtml(String(markdown || ""))}`;
+}
+
+function renderParserWarning(analysis) {
+  const safeAnalysis = analysis && typeof analysis === "object" ? analysis : {};
+  const parser = safeAnalysis.parser && typeof safeAnalysis.parser === "object"
+    ? safeAnalysis.parser
+    : {};
+  const scope = safeAnalysis.scope && typeof safeAnalysis.scope === "object"
+    ? safeAnalysis.scope
+    : {};
+  const errors = asList(parser.errors)
+    .filter((item) => typeof item === "string" && item.trim());
+  const truncated = parser.truncated === true || scope.truncated === true;
+  if (!errors.length && !truncated) return "";
+  const details = errors.length
+    ? `<ul>${errors.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
+    : "";
+  return `<div class="parser-warning"><strong>입력 파싱 경고:</strong> 일부 파일 또는 레코드만 분석되었을 수 있습니다.${details}</div>`;
+}
+
+function readPreference(key) {
+  try {
+    return window.localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writePreference(key, value) {
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    // Storage can be disabled by browser policy; the current form value still works.
+  }
 }
 
 function resolveAnalysisPayload(data) {
@@ -276,7 +339,7 @@ function renderFindings(analysisOrFindings) {
     ? scenarioCandidates.map(renderScenarioCandidate).join("")
     : `<p>연결 근거를 충족하는 2개 이상의 이벤트가 없어 구조화된 공격 시나리오 후보가 없습니다. 개별 의심 이벤트와 보고서 탭을 함께 확인하세요.</p>`;
 
-  findingsView.innerHTML = `${renderDetectionMeta(analysis.detection_meta, analysis.suspicious_event_scope)}
+  findingsView.innerHTML = `${renderParserWarning(analysis)}${renderDetectionMeta(analysis.detection_meta, analysis.suspicious_event_scope)}
     <section aria-labelledby="suspiciousEventsTitle">
       <h2 id="suspiciousEventsTitle">의심 이벤트</h2>
       <div class="finding-list">${suspiciousHtml}</div>
@@ -535,7 +598,7 @@ function renderFinding(finding) {
 function renderSummary(analysis) {
   const summary = analysis.summary || {};
   const scope = analysis.scope || {};
-  summaryView.innerHTML = `<div class="summary-grid">
+  summaryView.innerHTML = `${renderParserWarning(analysis)}<div class="summary-grid">
     ${renderScope(scope)}
     ${renderCounter("이벤트 ID", summary.top_event_ids)}
     ${renderCounter("호스트", summary.top_hosts)}

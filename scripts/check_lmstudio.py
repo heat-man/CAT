@@ -5,6 +5,7 @@ import json
 from math import isfinite
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
@@ -31,6 +32,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Only call /v1/models; skip the real chat completion probe.",
     )
+    parser.add_argument(
+        "--forward-api-key",
+        action="store_true",
+        help="Forward the configured API key when --base-url differs from LM_STUDIO_URL.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -40,7 +46,10 @@ def main(argv: list[str] | None = None) -> int:
         model = args.model.strip()
         if not model:
             raise ValueError("LM Studio model ID is empty")
-        headers = _headers()
+        headers = _headers(
+            args.base_url,
+            allow_custom=args.forward_api_key,
+        )
 
         models_url = reporting.models_endpoint(args.base_url)
         payload = _request_json(models_url, headers=headers, timeout=timeout)
@@ -76,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
             lm_url=chat_url,
             model=model,
             timeout_seconds=timeout,
+            strict_validation=True,
+            forward_api_key_to_custom_url=args.forward_api_key,
         )
         if not status.get("used"):
             raise RuntimeError(
@@ -119,10 +130,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _headers() -> dict[str, str]:
+def _headers(endpoint: str, *, allow_custom: bool = False) -> dict[str, str]:
     headers = {"Accept": "application/json"}
-    if reporting.DEFAULT_LM_API_KEY:
-        headers["Authorization"] = f"Bearer {reporting.DEFAULT_LM_API_KEY}"
+    if api_key := reporting._api_key_for_endpoint(
+        endpoint,
+        allow_custom=allow_custom,
+    ):
+        headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
 
@@ -270,9 +284,18 @@ def _request_json(
         data = json.dumps(body).encode("utf-8")
         method = "POST"
     req = request.Request(url, data=data, headers=request_headers, method=method)
+    deadline = perf_counter() + timeout
     try:
-        with reporting.open_lm_request(req, timeout=timeout) as response:
-            raw = response.read(8 * 1024 * 1024 + 1)
+        with reporting.open_lm_request(
+            req,
+            timeout=timeout,
+            deadline=deadline,
+        ) as response:
+            raw = reporting._read_stream_with_deadline(
+                response,
+                limit=8 * 1024 * 1024 + 1,
+                deadline=deadline,
+            )
         if len(raw) > 8 * 1024 * 1024:
             raise RuntimeError("LM Studio response is larger than 8 MiB")
         try:
@@ -280,7 +303,11 @@ def _request_json(
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("LM Studio returned invalid JSON") from exc
     except HTTPError as exc:
-        detail = exc.read(500).decode("utf-8", errors="replace")
+        detail = reporting._read_http_error_detail(
+            exc,
+            deadline=deadline,
+            timeout_seconds=timeout,
+        )
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
     except URLError as exc:
         if isinstance(exc.reason, TimeoutError):

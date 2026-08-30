@@ -1,5 +1,5 @@
 param(
-    [string]$BindHost = $(if ($env:HOST) { $env:HOST } else { "127.0.0.1" }),
+    [string]$BindHost = $(if ($env:CAT_HOST) { $env:CAT_HOST } elseif ($env:HOST) { $env:HOST } else { "0.0.0.0" }),
     [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 8000 }),
     [string]$VenvDir = $env:VENV_DIR
 )

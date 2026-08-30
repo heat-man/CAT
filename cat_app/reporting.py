@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from functools import partial
+import http.client
 import json
 from math import isfinite
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 from time import perf_counter
 from typing import Any
 from urllib import request
@@ -76,9 +80,21 @@ def _normalize_chat_endpoint_value(value: str) -> str:
     return urlunsplit((parsed.scheme.lower(), parsed.netloc, endpoint_path, "", ""))
 
 
+def _env_chat_endpoints(name: str) -> tuple[str, ...]:
+    endpoints = []
+    for item in os.getenv(name, "").split(","):
+        if not item.strip():
+            continue
+        try:
+            endpoints.append(_normalize_chat_endpoint_value(item))
+        except ValueError as exc:
+            raise RuntimeError(f"{name} 설정이 올바르지 않습니다: {exc}") from exc
+    return tuple(endpoints)
+
+
 _CONFIGURED_LM_STUDIO_URL = os.getenv(
     "LM_STUDIO_URL",
-    "http://172.16.100.51:1234/v1/chat/completions",
+    "http://127.0.0.1:1234/v1/chat/completions",
 )
 try:
     DEFAULT_LM_STUDIO_URL = _normalize_chat_endpoint_value(_CONFIGURED_LM_STUDIO_URL)
@@ -97,9 +113,13 @@ DEFAULT_LM_API_KEY = (
     else None
 )
 DEFAULT_LM_USE_PROXY = _env_bool("CAT_LM_USE_PROXY", False)
+DEFAULT_LM_STRICT_VALIDATION = _env_bool("CAT_LM_STRICT_VALIDATION", False)
+DEFAULT_LM_API_KEY_ALLOWED_ENDPOINTS = _env_chat_endpoints(
+    "CAT_LM_API_KEY_ALLOWED_ENDPOINTS"
+)
 DEFAULT_LM_TIMEOUT_SECONDS = _env_float(
     "CAT_LM_TIMEOUT_SECONDS",
-    300.0,
+    900.0,
     minimum=1.0,
     maximum=3600.0,
 )
@@ -120,21 +140,21 @@ DEFAULT_LM_ENABLE_THINKING = _env_bool("CAT_LM_ENABLE_THINKING", False)
 DEFAULT_LM_REASONING_EFFORT = os.getenv("CAT_LM_REASONING_EFFORT", "").strip()
 DEFAULT_LM_MAX_RESPONSE_BYTES = _env_int(
     "CAT_LM_MAX_RESPONSE_BYTES",
-    8 * 1024 * 1024,
+    32 * 1024 * 1024,
     minimum=1024,
-    maximum=64 * 1024 * 1024,
+    maximum=256 * 1024 * 1024,
 )
 DEFAULT_LM_MAX_INPUT_CHARS = _env_int(
     "CAT_LM_MAX_INPUT_CHARS",
-    65536,
+    256 * 1024,
     minimum=8192,
-    maximum=2 * 1024 * 1024,
+    maximum=8 * 1024 * 1024,
 )
 DEFAULT_LM_MAX_FIELD_CHARS = _env_int(
     "CAT_LM_MAX_FIELD_CHARS",
-    2000,
+    8192,
     minimum=128,
-    maximum=32768,
+    maximum=131072,
 )
 DEFAULT_CODEX_TIMEOUT_SECONDS = _env_int(
     "CAT_CODEX_TIMEOUT_SECONDS",
@@ -143,8 +163,31 @@ DEFAULT_CODEX_TIMEOUT_SECONDS = _env_int(
     maximum=3600,
 )
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MAX_LM_SUSPICIOUS_EVENTS = 40
-MAX_LM_SCENARIO_CANDIDATES = 20
+MAX_LM_FINDINGS = _env_int("CAT_LM_MAX_FINDINGS", 50, minimum=1, maximum=1000)
+MAX_LM_EVIDENCE_PER_FINDING = _env_int(
+    "CAT_LM_MAX_EVIDENCE_PER_FINDING",
+    12,
+    minimum=1,
+    maximum=256,
+)
+MAX_LM_SUSPICIOUS_EVENTS = _env_int(
+    "CAT_LM_MAX_SUSPICIOUS_EVENTS",
+    100,
+    minimum=1,
+    maximum=2000,
+)
+MAX_LM_SCENARIO_CANDIDATES = _env_int(
+    "CAT_LM_MAX_SCENARIO_CANDIDATES",
+    50,
+    minimum=1,
+    maximum=500,
+)
+MAX_LM_TIMELINE_EVENTS = _env_int(
+    "CAT_LM_MAX_TIMELINE_EVENTS",
+    200,
+    minimum=1,
+    maximum=5000,
+)
 REQUIRED_REPORT_SECTIONS = (
     "## 1. 분석 범위",
     "## 2. 핵심 요약",
@@ -157,6 +200,14 @@ REQUIRED_REPORT_SECTIONS = (
     "## 9. 추가 수집 및 대응 권고",
 )
 _CONFIDENCE_VALUES = {"high", "medium", "low"}
+_RELAXED_SUCCESS_FINISH_REASONS = {
+    "complete",
+    "completed",
+    "end_turn",
+    "eos",
+    "eos_token",
+    "stop",
+}
 
 
 def generate_report(
@@ -165,8 +216,15 @@ def generate_report(
     lm_url: str | None,
     model: str | None,
     timeout_seconds: float | None = None,
+    strict_validation: bool | None = None,
+    forward_api_key_to_custom_url: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     resolved_model = (model or DEFAULT_MODEL).strip()
+    require_strict_validation = (
+        DEFAULT_LM_STRICT_VALIDATION
+        if strict_validation is None
+        else bool(strict_validation)
+    )
     request_timeout = (
         DEFAULT_LM_TIMEOUT_SECONDS
         if timeout_seconds is None
@@ -183,6 +241,8 @@ def generate_report(
         "max_tokens": DEFAULT_LM_MAX_TOKENS,
         "max_input_chars": DEFAULT_LM_MAX_INPUT_CHARS,
         "thinking_enabled": DEFAULT_LM_ENABLE_THINKING,
+        "validation_mode": "strict" if require_strict_validation else "relaxed",
+        "validation_warnings": [],
     }
     if use_llm:
         try:
@@ -194,6 +254,8 @@ def generate_report(
                 llm_status["url"],
                 resolved_model,
                 timeout_seconds=request_timeout,
+                strict_validation=require_strict_validation,
+                forward_api_key_to_custom_url=forward_api_key_to_custom_url,
             )
             llm_status.update(response_metadata)
             llm_status["used"] = True
@@ -294,6 +356,8 @@ def _generate_lm_report(
     model: str,
     *,
     timeout_seconds: float | None = None,
+    strict_validation: bool = DEFAULT_LM_STRICT_VALIDATION,
+    forward_api_key_to_custom_url: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     messages, input_metadata = _build_agent_messages_with_metadata(analysis)
     allowed_event_refs = list(input_metadata.get("_allowed_event_refs", []))
@@ -331,11 +395,12 @@ def _generate_lm_report(
             "type": "json_schema",
             "json_schema": {
                 "name": "cat_incident_report",
-                "strict": True,
+                "strict": strict_validation,
                 "schema": _report_json_schema(
                     allowed_event_refs,
                     allowed_scenario_event_sets=allowed_scenario_event_sets,
                     allowed_scenario_contracts=allowed_scenario_contracts,
+                    relaxed=not strict_validation,
                 ),
             },
         },
@@ -344,66 +409,448 @@ def _generate_lm_report(
         payload["reasoning_effort"] = DEFAULT_LM_REASONING_EFFORT
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if DEFAULT_LM_API_KEY:
-        headers["Authorization"] = f"Bearer {DEFAULT_LM_API_KEY}"
+    api_key = _api_key_for_endpoint(
+        endpoint,
+        allow_custom=forward_api_key_to_custom_url,
+    )
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = request.Request(
         endpoint,
         data=body,
         headers=headers,
         method="POST",
     )
-    try:
-        with open_lm_request(req, timeout=request_timeout) as response:
-            raw_response = response.read(DEFAULT_LM_MAX_RESPONSE_BYTES + 1)
-        if len(raw_response) > DEFAULT_LM_MAX_RESPONSE_BYTES:
-            raise RuntimeError(
-                f"LM Studio 응답이 {DEFAULT_LM_MAX_RESPONSE_BYTES}바이트 제한을 초과했습니다."
-            )
-        try:
-            data = json.loads(raw_response.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            detail = raw_response[:500].decode("utf-8", errors="replace")
-            raise RuntimeError(f"LM Studio가 올바른 JSON을 반환하지 않았습니다: {detail}") from exc
-    except HTTPError as exc:
-        detail = exc.read(500).decode("utf-8", errors="replace")
-        raise RuntimeError(f"LM Studio HTTP {exc.code}: {detail[:500]}") from exc
-    except URLError as exc:
-        if isinstance(exc.reason, TimeoutError):
-            raise RuntimeError(
-                f"LM Studio 응답이 {request_timeout:g}초 제한을 초과했습니다."
-            ) from exc
-        raise RuntimeError(f"LM Studio 연결 실패: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError(
-            f"LM Studio 응답이 {request_timeout:g}초 제한을 초과했습니다."
-        ) from exc
+    request_deadline = perf_counter() + request_timeout
 
-    report, response_metadata = parse_chat_completion(data)
+    def remaining_timeout() -> float:
+        remaining = request_deadline - perf_counter()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"LM Studio 요청과 호환 재시도가 전체 {request_timeout:g}초 제한을 "
+                "초과했습니다."
+            )
+        return remaining
+
+    request_warnings: list[str] = []
+    try:
+        data = _read_lm_response(
+            req,
+            timeout=remaining_timeout(),
+            preserve_http_error=True,
+        )
+    except HTTPError as exc:
+        detail = _read_http_error_detail(
+            exc,
+            deadline=request_deadline,
+            timeout_seconds=request_timeout,
+        )
+        if strict_validation or exc.code not in {400, 415, 422}:
+            raise RuntimeError(f"LM Studio HTTP {exc.code}: {detail[:500]}") from exc
+        payload["response_format"] = {"type": "json_object"}
+        for optional_key in (
+            "top_k",
+            "presence_penalty",
+            "reasoning_effort",
+        ):
+            payload.pop(optional_key, None)
+        retry = request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        request_warnings.append(
+            "LM Studio가 json_schema 요청을 거부하여 호환 파라미터와 json_object 형식으로 "
+            "자동 재시도했습니다"
+            f"(첫 응답 HTTP {exc.code}: {detail[:200]})."
+        )
+        try:
+            data = _read_lm_response(
+                retry,
+                timeout=remaining_timeout(),
+                preserve_http_error=True,
+            )
+        except HTTPError as retry_exc:
+            retry_detail = _read_http_error_detail(
+                retry_exc,
+                deadline=request_deadline,
+                timeout_seconds=request_timeout,
+            )
+            if retry_exc.code not in {400, 415, 422}:
+                raise RuntimeError(
+                    f"LM Studio HTTP {retry_exc.code}: {retry_detail[:500]}"
+                ) from retry_exc
+            payload.pop("response_format", None)
+            plain_retry = request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            data = _read_lm_response(
+                plain_retry,
+                timeout=remaining_timeout(),
+            )
+            request_warnings.append(
+                "LM Studio가 json_object도 거부하여 response_format 없이 자동 재시도했습니다"
+                f"(두 번째 응답 HTTP {retry_exc.code}: {retry_detail[:200]})."
+            )
+
+    report, response_metadata = parse_chat_completion(
+        data,
+        require_stop=strict_validation,
+    )
+    prevalidated_report: tuple[str, dict[str, Any]] | None = None
+    if not strict_validation and response_metadata.get("completion_incomplete"):
+        # A syntactically closed fragment such as {"analysis_scope":"..."}
+        # can still be the beginning of a token-limited response.  Do not let
+        # relaxed normalization synthesize the missing report and label that as
+        # a successful LM analysis.  Known token-limit finishes are accepted
+        # only when the model actually returned the complete trusted contract.
+        try:
+            prevalidated_report = validate_structured_report(
+                report,
+                allowed_event_refs=allowed_event_refs,
+                allowed_scenario_event_sets=allowed_scenario_event_sets,
+                allowed_scenario_contracts=allowed_scenario_contracts,
+                allowed_event_facts=allowed_event_facts,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "LM Studio 응답이 완료되지 않았거나 출력 한도에서 잘렸고 완전한 "
+                "구조화 보고서로 "
+                "검증되지 않았습니다. CAT_LM_MAX_TOKENS를 늘리거나 분석 범위를 "
+                "줄이세요."
+            ) from exc
     input_metadata.pop("_allowed_event_refs", None)
     input_metadata.pop("_allowed_scenario_event_sets", None)
     input_metadata.pop("_allowed_scenario_contracts", None)
     input_metadata.pop("_allowed_event_facts", None)
-    report, structured_metadata = validate_structured_report(
-        report,
-        allowed_event_refs=allowed_event_refs,
-        allowed_scenario_event_sets=allowed_scenario_event_sets,
-        allowed_scenario_contracts=allowed_scenario_contracts,
-        allowed_event_facts=allowed_event_facts,
-    )
+    if prevalidated_report is not None:
+        report, structured_metadata = prevalidated_report
+    else:
+        try:
+            report, structured_metadata = validate_structured_report(
+                report,
+                allowed_event_refs=allowed_event_refs,
+                allowed_scenario_event_sets=allowed_scenario_event_sets,
+                allowed_scenario_contracts=allowed_scenario_contracts,
+                allowed_event_facts=allowed_event_facts,
+            )
+        except RuntimeError as exc:
+            if strict_validation:
+                raise
+            report, structured_metadata = _recover_lm_report(
+                report,
+                validation_error=str(exc),
+                allowed_event_refs=allowed_event_refs,
+                allowed_scenario_contracts=allowed_scenario_contracts,
+                allowed_event_facts=allowed_event_facts,
+            )
+    response_metadata["api_key_forwarded"] = bool(api_key)
+    validation_warnings = [
+        *request_warnings,
+        *response_metadata.get("validation_warnings", []),
+        *structured_metadata.pop("validation_warnings", []),
+    ]
     response_metadata.update(structured_metadata)
+    response_metadata["validation_warnings"] = validation_warnings
     response_metadata.update(input_metadata)
     return report, response_metadata
 
 
-def open_lm_request(req: request.Request, timeout: float) -> Any:
+def _read_lm_response(
+    req: request.Request,
+    *,
+    timeout: float,
+    preserve_http_error: bool = False,
+) -> Any:
+    response_deadline = perf_counter() + timeout
+    try:
+        with open_lm_request(
+            req,
+            timeout=timeout,
+            deadline=response_deadline,
+        ) as response:
+            raw_response = _read_stream_with_deadline(
+                response,
+                limit=DEFAULT_LM_MAX_RESPONSE_BYTES + 1,
+                deadline=response_deadline,
+            )
+    except HTTPError as exc:
+        if preserve_http_error:
+            raise
+        detail = _read_http_error_detail(
+            exc,
+            deadline=response_deadline,
+            timeout_seconds=timeout,
+        )
+        raise RuntimeError(f"LM Studio HTTP {exc.code}: {detail[:500]}") from exc
+    except URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise RuntimeError(
+                f"LM Studio 응답이 {timeout:g}초 제한을 초과했습니다."
+            ) from exc
+        raise RuntimeError(f"LM Studio 연결 실패: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"LM Studio 응답이 {timeout:g}초 제한을 초과했습니다."
+        ) from exc
+
+    if len(raw_response) > DEFAULT_LM_MAX_RESPONSE_BYTES:
+        raise RuntimeError(
+            f"LM Studio 응답이 {DEFAULT_LM_MAX_RESPONSE_BYTES}바이트 제한을 초과했습니다."
+        )
+    try:
+        # Some OpenAI-compatible servers have emitted JavaScript constants such
+        # as NaN in optional usage metadata.  They are not valid JSON and make
+        # the browser reject CAT's otherwise successful response.  Preserve the
+        # useful completion while normalizing only those constants to null.
+        return json.loads(
+            raw_response.decode("utf-8"),
+            parse_constant=lambda _value: None,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        detail = raw_response[:500].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"LM Studio가 올바른 JSON을 반환하지 않았습니다: {detail}"
+        ) from exc
+
+
+def _read_http_error_detail(
+    error: HTTPError,
+    *,
+    deadline: float,
+    timeout_seconds: float,
+) -> str:
+    try:
+        return _read_stream_with_deadline(
+            error,
+            limit=500,
+            deadline=deadline,
+        ).decode("utf-8", errors="replace")
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"LM Studio 응답이 전체 {timeout_seconds:g}초 제한을 초과했습니다."
+        ) from exc
+    finally:
+        error.close()
+
+
+def _read_stream_with_deadline(
+    stream: Any,
+    *,
+    limit: int,
+    deadline: float,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    read_once = getattr(stream, "read1", None)
+    if not callable(read_once):
+        read_once = stream.read
+    while total < limit:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            raise TimeoutError("response deadline exceeded")
+        _set_stream_socket_timeout(stream, remaining)
+        chunk = read_once(min(64 * 1024, limit - total))
+        if not chunk:
+            break
+        if not isinstance(chunk, bytes):
+            raise RuntimeError("LM Studio 응답 스트림이 bytes를 반환하지 않았습니다.")
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _set_stream_socket_timeout(stream: Any, timeout: float) -> bool:
+    for path in (
+        ("_sock",),
+        ("raw", "_sock"),
+        ("fp", "raw", "_sock"),
+        ("fp", "fp", "raw", "_sock"),
+        ("file", "raw", "_sock"),
+    ):
+        candidate = stream
+        for attribute in path:
+            candidate = getattr(candidate, attribute, None)
+            if candidate is None:
+                break
+        if candidate is None:
+            continue
+        settimeout = getattr(candidate, "settimeout", None)
+        if callable(settimeout):
+            settimeout(timeout)
+            return True
+    return False
+
+
+class _DeadlineConnectionMixin:
+    def __init__(self, *args: Any, deadline: float, **kwargs: Any) -> None:
+        self._cat_response_header_deadline = deadline
+        super().__init__(*args, **kwargs)
+
+    def getresponse(self) -> Any:
+        return self._run_header_operation(
+            super().getresponse,
+            close_result_on_expiry=True,
+        )
+
+    def _tunnel(self) -> Any:
+        # HTTPS through an HTTP proxy reads a separate CONNECT response before
+        # getresponse().  Apply the same absolute deadline to those proxy
+        # headers so enabling CAT_LM_USE_PROXY cannot reintroduce header drip.
+        return self._run_header_operation(
+            super()._tunnel,
+            close_result_on_expiry=False,
+        )
+
+    def _run_header_operation(
+        self,
+        operation: Any,
+        *,
+        close_result_on_expiry: bool,
+    ) -> Any:
+        remaining = self._cat_response_header_deadline - perf_counter()
+        if remaining <= 0:
+            raise TimeoutError("response header deadline exceeded")
+
+        state_lock = threading.Lock()
+        state = {"expired": False, "finished": False}
+
+        def abort_header_read() -> None:
+            # The deadline callback and getresponse() may both run immediately
+            # after the final header byte arrives.  Decide which side won while
+            # holding one lock so a late callback cannot shut down a response
+            # that has already been returned to the body reader.
+            with state_lock:
+                if state["finished"]:
+                    return
+                state["expired"] = True
+                active_socket = getattr(self, "sock", None)
+            if active_socket is None:
+                return
+            try:
+                active_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        timer = threading.Timer(remaining, abort_header_read)
+        timer.daemon = True
+        timer.start()
+        try:
+            try:
+                result = operation()
+            except BaseException as exc:
+                with state_lock:
+                    expired = (
+                        state["expired"]
+                        or perf_counter() >= self._cat_response_header_deadline
+                    )
+                    state["finished"] = True
+                if expired and isinstance(exc, Exception):
+                    raise TimeoutError("response header deadline exceeded") from exc
+                raise
+
+            with state_lock:
+                expired = (
+                    state["expired"]
+                    or perf_counter() >= self._cat_response_header_deadline
+                )
+                state["finished"] = True
+            if expired:
+                if close_result_on_expiry:
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                else:
+                    self.close()
+                raise TimeoutError("response header deadline exceeded")
+            return result
+        finally:
+            timer.cancel()
+
+
+class _DeadlineHTTPConnection(_DeadlineConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnectionMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _DeadlineHTTPHandler(request.HTTPHandler):
+    def __init__(self, deadline: float) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: request.Request) -> Any:
+        connection = partial(_DeadlineHTTPConnection, deadline=self._deadline)
+        return self.do_open(connection, req)
+
+
+class _DeadlineHTTPSHandler(request.HTTPSHandler):
+    def __init__(self, deadline: float) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def https_open(self, req: request.Request) -> Any:
+        connection = partial(_DeadlineHTTPSConnection, deadline=self._deadline)
+        return self.do_open(connection, req, context=self._context)
+
+
+def open_lm_request(
+    req: request.Request,
+    timeout: float,
+    *,
+    deadline: float | None = None,
+) -> Any:
     """Open an LM request directly by default and never follow HTTP redirects."""
+    if deadline is None:
+        deadline = perf_counter() + timeout
     proxy_handler = (
         request.ProxyHandler()
         if DEFAULT_LM_USE_PROXY
         else request.ProxyHandler({})
     )
-    opener = request.build_opener(proxy_handler, _NoRedirectHandler())
+    opener = request.build_opener(
+        proxy_handler,
+        _DeadlineHTTPHandler(deadline),
+        _DeadlineHTTPSHandler(deadline),
+        _NoRedirectHandler(),
+    )
     return opener.open(req, timeout=timeout)
+
+
+def _api_key_for_endpoint(
+    endpoint: str,
+    *,
+    allow_custom: bool | None = None,
+) -> str | None:
+    if not DEFAULT_LM_API_KEY:
+        return None
+    if _endpoint_identity(endpoint) == _endpoint_identity(DEFAULT_LM_STUDIO_URL):
+        return DEFAULT_LM_API_KEY
+    if allow_custom is True:
+        return DEFAULT_LM_API_KEY
+    if any(
+        _endpoint_identity(endpoint) == _endpoint_identity(allowed)
+        for allowed in DEFAULT_LM_API_KEY_ALLOWED_ENDPOINTS
+    ):
+        return DEFAULT_LM_API_KEY
+    return None
+
+
+def _endpoint_identity(value: str) -> tuple[str, str, int, str]:
+    parsed = urlsplit(normalize_chat_endpoint(value))
+    port = parsed.port or (80 if parsed.scheme.lower() == "http" else 443)
+    return (
+        parsed.scheme.lower(),
+        (parsed.hostname or "").lower(),
+        port,
+        parsed.path,
+    )
 
 
 class _NoRedirectHandler(request.HTTPRedirectHandler):
@@ -539,7 +986,11 @@ def _chat_endpoint(value: str) -> str:
     return normalize_chat_endpoint(value)
 
 
-def parse_chat_completion(data: Any) -> tuple[str, dict[str, Any]]:
+def parse_chat_completion(
+    data: Any,
+    *,
+    require_stop: bool = True,
+) -> tuple[str, dict[str, Any]]:
     if not isinstance(data, dict):
         raise RuntimeError(f"LM Studio 응답이 JSON 객체가 아닙니다: {str(data)[:500]}")
     if isinstance(data.get("error"), dict):
@@ -553,14 +1004,27 @@ def parse_chat_completion(data: Any) -> tuple[str, dict[str, Any]]:
     choice = choices[0]
     message = choice.get("message")
     if not isinstance(message, dict):
-        raise RuntimeError(f"LM Studio 응답에 assistant message가 없습니다: {str(data)[:500]}")
+        if not require_stop and isinstance(choice.get("text"), str):
+            message = {"content": choice["text"]}
+        else:
+            raise RuntimeError(
+                f"LM Studio 응답에 assistant message가 없습니다: {str(data)[:500]}"
+            )
 
     content = _text_content(message.get("content"))
-    finish_reason = choice.get("finish_reason")
-    if finish_reason != "stop":
+    if not content and isinstance(message.get("parsed"), (dict, list)):
+        content = json.dumps(message["parsed"], ensure_ascii=False)
+    finish_reason = _safe_finish_reason(choice.get("finish_reason"))
+    completion_warnings: list[str] = []
+    if finish_reason != "stop" and require_stop:
         raise RuntimeError(
             f"LM Studio 응답이 완결되지 않았습니다(finish_reason={finish_reason!r}). "
             "CAT_LM_MAX_TOKENS 또는 모델 설정을 확인하세요."
+        )
+    if finish_reason != "stop":
+        completion_warnings.append(
+            "LM Studio finish_reason이 "
+            f"{finish_reason!r}이지만 반환된 content를 완화 모드로 처리했습니다."
         )
     content, thinking_content_removed = _strip_leading_thinking(content)
     if not content:
@@ -570,11 +1034,27 @@ def parse_chat_completion(data: Any) -> tuple[str, dict[str, Any]]:
         detail = " reasoning만 반환되었습니다." if reasoning else ""
         raise RuntimeError(f"LM Studio가 빈 보고서를 반환했습니다.{detail}")
 
-    usage = data.get("usage")
+    usage = _safe_usage_metadata(data.get("usage"))
     return content, {
         "finish_reason": finish_reason,
-        "usage": usage if isinstance(usage, dict) else None,
+        "usage": usage,
         "thinking_content_removed": thinking_content_removed,
+        # Missing/blank finish reasons are emitted by some OpenAI-compatible
+        # servers.  Any explicit reason other than a small success allowlist is
+        # treated as incomplete: failure reasons are not standardized, so a
+        # blocklist could let variants such as "server_error" slip through.
+        "completion_incomplete": not (
+            finish_reason is None
+            or (
+                isinstance(finish_reason, str)
+                and (
+                    not finish_reason.strip()
+                    or finish_reason.strip().lower()
+                    in _RELAXED_SUCCESS_FINISH_REASONS
+                )
+            )
+        ),
+        "validation_warnings": completion_warnings,
     }
 
 
@@ -597,16 +1077,53 @@ def _text_content(value: Any) -> str:
     return "\n".join(part.strip() for part in parts if part.strip()).strip()
 
 
+def _safe_usage_metadata(value: Any) -> dict[str, int | float | None] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, int | float | None] = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
+    ):
+        item = value.get(key)
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            result[key] = item
+        elif item is None and key in value:
+            result[key] = None
+    return result or None
+
+
+def _safe_finish_reason(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        # Keep the status JSON shallow and make an explicitly malformed reason
+        # fail the relaxed completeness gate instead of treating it as absent.
+        return "<invalid>"
+    return value[:256]
+
+
 def _strip_leading_thinking(content: str) -> tuple[str, bool]:
-    result = content.lstrip()
+    # Keep a moving offset instead of slicing the remaining response after
+    # every block.  Repeated leading blocks can otherwise make this quadratic
+    # in the response size.
+    offset = 0
+    content_length = len(content)
+    while offset < content_length and content[offset].isspace():
+        offset += 1
     removed = False
-    while result.startswith("<think>"):
-        closing_index = result.find("</think>", len("<think>"))
+    while content.startswith("<think>", offset):
+        closing_index = content.find("</think>", offset + len("<think>"))
         if closing_index < 0:
             raise RuntimeError("LM Studio 응답의 <think> 블록이 닫히지 않았습니다.")
-        result = result[closing_index + len("</think>") :].lstrip()
+        offset = closing_index + len("</think>")
+        while offset < content_length and content[offset].isspace():
+            offset += 1
         removed = True
-    return result.strip(), removed
+    return content[offset:].strip(), removed
 
 
 def validate_structured_report(
@@ -645,11 +1162,511 @@ def validate_structured_report(
     ), structured_metadata
 
 
+def _recover_lm_report(
+    content: str,
+    *,
+    validation_error: str,
+    allowed_event_refs: list[str],
+    allowed_scenario_contracts: list[dict[str, Any]],
+    allowed_event_facts: dict[str, dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    structured = _relaxed_json_object(content)
+    recognized_sections = {
+        "analysis_scope",
+        "executive_summary",
+        "suspicious_events",
+        "major_findings",
+        "timeline",
+        "attack_scenarios",
+        "related_entities",
+        "evidence_limitations",
+        "recommendations",
+        "no_scenario_reason",
+    }
+    if structured is not None and not any(
+        _has_substantive_report_section(
+            key,
+            structured.get(key),
+            allowed_event_refs=set(allowed_event_refs),
+            allowed_scenario_contracts=allowed_scenario_contracts,
+            allowed_event_facts=allowed_event_facts,
+        )
+        for key in recognized_sections
+        if key in structured
+    ):
+        structured = None
+    warning = (
+        "엄격한 구조 검증을 통과하지 못해 CAT가 모델 응답을 보정했습니다: "
+        f"{validation_error}"
+    )
+    if structured is None:
+        report = "\n".join(
+            [
+                "# CAT LM Studio 분석 보고서",
+                "",
+                "## 응답 검증 안내",
+                "- LM Studio 응답을 구조화 JSON으로 해석하지 못해 원문을 표시합니다.",
+                "- 아래 내용은 검증되지 않은 모델 해석이며, 탐지 결과 탭의 CAT 원본 근거와 대조해야 합니다.",
+                "",
+                "## LM Studio 원문 (검증되지 않음)",
+                "",
+                content.strip(),
+            ]
+        ).rstrip()
+        return report, {
+            "structured_report_validated": False,
+            "structured_report_recovered": False,
+            "unstructured_report_used": True,
+            "validation_warnings": [warning],
+        }
+
+    normalized = _normalize_relaxed_structured_payload(
+        structured,
+        allowed_event_refs=allowed_event_refs,
+        allowed_scenario_contracts=allowed_scenario_contracts,
+        allowed_event_facts=allowed_event_facts,
+    )
+    validated_metadata = _validate_structured_payload(
+        normalized,
+        allowed_event_refs=allowed_event_refs,
+        allowed_scenario_event_sets=[
+            tuple(contract.get("event_refs") or [])
+            for contract in allowed_scenario_contracts
+        ],
+        allowed_scenario_contracts=allowed_scenario_contracts,
+        allowed_event_facts=allowed_event_facts,
+    )
+    report = _render_structured_report(
+        normalized,
+        allowed_scenario_contracts=allowed_scenario_contracts,
+        allowed_event_facts=allowed_event_facts,
+    )
+    heading, separator, remainder = report.partition("\n")
+    recovery_notice = (
+        "> **응답 보정 안내:** LM Studio 응답이 strict 계약과 달라 CAT가 "
+        "canonical 이벤트 사실을 기준으로 보정했습니다. 아래 모델 해석은 원본 "
+        "EVTX와 대조해야 합니다."
+    )
+    report = (
+        f"{heading}\n\n{recovery_notice}\n\n{remainder.lstrip()}"
+        if separator
+        else f"{report}\n\n{recovery_notice}"
+    )
+    validated_metadata.update(
+        {
+            "structured_report_validated": False,
+            "structured_report_recovered": True,
+            "unstructured_report_used": False,
+            "validation_warnings": [warning],
+        }
+    )
+    return report, validated_metadata
+
+
+def _relaxed_json_object(content: str) -> dict[str, Any] | None:
+    cleaned = content.lstrip("\ufeff \t\r\n")
+    candidates = [cleaned]
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    opening = cleaned.find("{")
+    closing = cleaned.rfind("}")
+    if 0 <= opening < closing:
+        candidates.append(cleaned[opening : closing + 1])
+
+    for candidate in candidates:
+        try:
+            value = json.loads(
+                candidate,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"허용되지 않는 JSON 상수: {value}")
+                ),
+            )
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _has_substantive_report_section(
+    key: str,
+    value: Any,
+    *,
+    allowed_event_refs: set[str],
+    allowed_scenario_contracts: list[dict[str, Any]],
+    allowed_event_facts: dict[str, dict[str, Any]],
+) -> bool:
+    if key in {"analysis_scope", "executive_summary"}:
+        return isinstance(value, str) and bool(value.strip())
+    if key == "no_scenario_reason":
+        return (
+            not allowed_scenario_contracts
+            and isinstance(value, str)
+            and bool(value.strip())
+        )
+    if key in {"evidence_limitations", "recommendations"}:
+        return bool(_nonempty_text_items(value))
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        if key == "suspicious_events":
+            event_ref = item.get("event_ref")
+            if not isinstance(event_ref, str) or event_ref not in allowed_event_refs:
+                continue
+            if _suspicious_event_has_model_content(item):
+                return True
+        elif key == "major_findings":
+            refs = _relaxed_known_refs(item.get("event_refs"), allowed_event_refs)
+            if refs and any(
+                isinstance(item.get(field), str) and item[field].strip()
+                for field in {
+                    "title",
+                    "assessment",
+                    "observed_behavior",
+                    "unproven",
+                    "follow_up",
+                }
+            ):
+                return True
+        elif key == "attack_scenarios":
+            item_refs = _relaxed_known_refs(item.get("event_refs"), allowed_event_refs)
+            for contract in allowed_scenario_contracts:
+                contract_refs = set(contract.get("event_refs") or [])
+                if not (
+                    item.get("scenario_id") == contract.get("scenario_id")
+                    or set(item_refs) == contract_refs
+                ):
+                    continue
+                if _scenario_has_model_content(item, contract_refs):
+                    return True
+        elif key == "related_entities":
+            entity_type = item.get("entity_type")
+            entity_value = item.get("value")
+            refs = _relaxed_known_refs(item.get("event_refs"), allowed_event_refs)
+            if (
+                isinstance(entity_type, str)
+                and entity_type in {"account", "host", "ip", "process", "other"}
+                and isinstance(entity_value, str)
+                and entity_value.strip()
+                and refs
+                and _entity_value_is_observed(
+                    entity_type,
+                    entity_value,
+                    refs,
+                    allowed_event_facts,
+                )
+            ):
+                return True
+    return False
+
+
+def _suspicious_event_has_model_content(item: dict[str, Any]) -> bool:
+    return bool(
+        (isinstance(item.get("reason"), str) and item["reason"].strip())
+        or (
+            isinstance(item.get("confidence"), str)
+            and item["confidence"] in _CONFIDENCE_VALUES
+        )
+    )
+
+
+def _scenario_has_model_content(
+    item: dict[str, Any],
+    contract_refs: set[str],
+) -> bool:
+    if _nonempty_text_items(item.get("limitations")):
+        return True
+    steps = item.get("steps")
+    return isinstance(steps, list) and any(
+        isinstance(step, dict)
+        and isinstance(step.get("event_ref"), str)
+        and step["event_ref"] in contract_refs
+        and isinstance(step.get("inference"), str)
+        and bool(step["inference"].strip())
+        for step in steps
+    )
+
+
+def _normalize_relaxed_structured_payload(
+    value: dict[str, Any],
+    *,
+    allowed_event_refs: list[str],
+    allowed_scenario_contracts: list[dict[str, Any]],
+    allowed_event_facts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    expected_refs = set(allowed_event_refs)
+
+    def text_or(source: Any, fallback: str) -> str:
+        return source.strip() if isinstance(source, str) and source.strip() else fallback
+
+    source_events = value.get("suspicious_events")
+    event_interpretations: dict[str, dict[str, Any]] = {}
+    if isinstance(source_events, list):
+        for item in source_events:
+            if not isinstance(item, dict):
+                continue
+            event_ref = item.get("event_ref")
+            if not isinstance(event_ref, str) or event_ref not in expected_refs:
+                continue
+            existing = event_interpretations.get(event_ref)
+            if existing is None or (
+                not _suspicious_event_has_model_content(existing)
+                and _suspicious_event_has_model_content(item)
+            ):
+                event_interpretations[event_ref] = item
+
+    suspicious_events = []
+    for event_ref in allowed_event_refs:
+        source = event_interpretations.get(event_ref, {})
+        fact = allowed_event_facts.get(event_ref, {})
+        confidence = source.get("confidence")
+        if not isinstance(confidence, str) or confidence not in _CONFIDENCE_VALUES:
+            confidence = fact.get("confidence")
+        if not isinstance(confidence, str) or confidence not in _CONFIDENCE_VALUES:
+            confidence = "medium"
+        suspicious_events.append(
+            {
+                "event_ref": event_ref,
+                "reason": text_or(
+                    source.get("reason"),
+                    "CAT 규칙 엔진에서 의심 이벤트로 탐지되어 추가 확인이 필요합니다.",
+                ),
+                "confidence": confidence,
+            }
+        )
+
+    major_findings = []
+    source_findings = value.get("major_findings")
+    if isinstance(source_findings, list):
+        for item in source_findings:
+            if not isinstance(item, dict):
+                continue
+            refs = _relaxed_known_refs(item.get("event_refs"), expected_refs)
+            if not refs:
+                continue
+            observations = [
+                str(allowed_event_facts.get(ref, {}).get("observation") or "")
+                for ref in refs
+            ]
+            observations = [observation for observation in observations if observation]
+            major_findings.append(
+                {
+                    "title": text_or(item.get("title"), "LM Studio 주요 분석"),
+                    "assessment": text_or(
+                        item.get("assessment"),
+                        "참조 이벤트에 대한 추가 조사 가설입니다.",
+                    ),
+                    "event_refs": refs,
+                    "observed_behavior": text_or(
+                        item.get("observed_behavior"),
+                        " / ".join(observations) or "CAT 의심 이벤트가 관측되었습니다.",
+                    ),
+                    "unproven": text_or(
+                        item.get("unproven"),
+                        "현재 로그만으로 침해 여부와 인과관계는 확정되지 않습니다.",
+                    ),
+                    "follow_up": text_or(
+                        item.get("follow_up"),
+                        "원본 EVTX, EDR, 네트워크 로그를 교차 확인하세요.",
+                    ),
+                }
+            )
+
+    source_timeline = value.get("timeline")
+    requested_timeline_refs: list[str] = []
+    if isinstance(source_timeline, list):
+        requested_timeline_refs = _relaxed_known_refs(
+            [
+                item.get("event_ref")
+                for item in source_timeline
+                if isinstance(item, dict)
+            ],
+            expected_refs,
+        )
+    timeline_ref_set = set(requested_timeline_refs or allowed_event_refs)
+    timeline = []
+    for event_ref in allowed_event_refs:
+        if event_ref not in timeline_ref_set:
+            continue
+        fact = allowed_event_facts.get(event_ref, {})
+        timeline.append(
+            {
+                "time": str(fact.get("time") or "시간 없음"),
+                "event_ref": event_ref,
+                "description": str(
+                    fact.get("observation")
+                    or f"{event_ref} CAT 규칙 기반 의심 이벤트"
+                ),
+            }
+        )
+
+    source_scenarios = value.get("attack_scenarios")
+    scenario_items = (
+        [item for item in source_scenarios if isinstance(item, dict)]
+        if isinstance(source_scenarios, list)
+        else []
+    )
+    attack_scenarios = []
+    for contract in allowed_scenario_contracts:
+        refs = list(contract.get("event_refs") or [])
+        contract_ref_set = set(refs)
+        scenario_id = str(contract.get("scenario_id") or "SCN-001")
+        matching_sources = [
+            item
+            for item in scenario_items
+            if item.get("scenario_id") == scenario_id
+            or set(_relaxed_known_refs(item.get("event_refs"), expected_refs))
+            == contract_ref_set
+        ]
+        source = next(
+            (
+                item
+                for item in matching_sources
+                if _scenario_has_model_content(item, contract_ref_set)
+            ),
+            matching_sources[0] if matching_sources else {},
+        )
+        source_steps_value = source.get("steps") if isinstance(source, dict) else None
+        source_steps = source_steps_value if isinstance(source_steps_value, list) else []
+        inference_by_ref: dict[str, str] = {}
+        for step in source_steps:
+            if not isinstance(step, dict):
+                continue
+            step_ref = step.get("event_ref")
+            inference = step.get("inference")
+            if (
+                not isinstance(step_ref, str)
+                or step_ref not in expected_refs
+                or step_ref in inference_by_ref
+                or not isinstance(inference, str)
+                or not inference.strip()
+            ):
+                continue
+            inference_by_ref[step_ref] = inference
+        steps = []
+        for order, event_ref in enumerate(refs, start=1):
+            fact = allowed_event_facts.get(event_ref, {})
+            steps.append(
+                {
+                    "order": order,
+                    "event_ref": event_ref,
+                    "observed": str(
+                        fact.get("observation")
+                        or f"{event_ref} CAT 규칙 기반 의심 이벤트"
+                    ),
+                    "inference": text_or(
+                        inference_by_ref.get(event_ref),
+                        str(contract.get("hypothesis") or "추가 상관 분석이 필요합니다."),
+                    ),
+                }
+            )
+        limitations = _nonempty_text_items(
+            source.get("limitations") if isinstance(source, dict) else None
+        )
+        if not limitations:
+            limitations = _nonempty_text_items(contract.get("evidence_gaps"))
+        attack_scenarios.append(
+            {
+                "scenario_id": scenario_id,
+                "title": str(contract.get("title") or f"{scenario_id} 조사 가설"),
+                "confidence": (
+                    contract.get("confidence")
+                    if contract.get("confidence") in _CONFIDENCE_VALUES
+                    else "low"
+                ),
+                "event_refs": refs,
+                "steps": steps,
+                "limitations": limitations
+                or ["원본 EVTX와 추가 보안 로그의 교차 검증이 필요합니다."],
+            }
+        )
+
+    related_entities = []
+    source_entities = value.get("related_entities")
+    if isinstance(source_entities, list):
+        for entity in source_entities:
+            if not isinstance(entity, dict):
+                continue
+            entity_type = entity.get("entity_type")
+            entity_value = entity.get("value")
+            refs = _relaxed_known_refs(entity.get("event_refs"), expected_refs)
+            if (
+                not isinstance(entity_type, str)
+                or entity_type not in {"account", "host", "ip", "process", "other"}
+                or not isinstance(entity_value, str)
+                or not entity_value.strip()
+                or not refs
+                or not _entity_value_is_observed(
+                    entity_type,
+                    entity_value,
+                    refs,
+                    allowed_event_facts,
+                )
+            ):
+                continue
+            related_entities.append(
+                {
+                    "entity_type": entity_type,
+                    "value": entity_value,
+                    "event_refs": refs,
+                }
+            )
+
+    limitations = _nonempty_text_items(value.get("evidence_limitations"))
+    recommendations = _nonempty_text_items(value.get("recommendations"))
+    return {
+        "schema_version": 1,
+        "analysis_scope": text_or(
+            value.get("analysis_scope"),
+            "CAT가 전달한 이벤트와 선택한 분석 시간 범위",
+        ),
+        "executive_summary": text_or(
+            value.get("executive_summary"),
+            "LM Studio 응답의 유효한 부분을 CAT 원본 근거와 결합했습니다.",
+        ),
+        "suspicious_events": suspicious_events,
+        "major_findings": major_findings,
+        "timeline": timeline,
+        "attack_scenarios": attack_scenarios,
+        "related_entities": related_entities,
+        "evidence_limitations": limitations
+        or ["완화 검증으로 복구된 보고서이므로 CAT 원본 근거와 대조해야 합니다."],
+        "recommendations": recommendations
+        or ["원본 EVTX, EDR, 네트워크 로그를 교차 확인하세요."],
+        "no_scenario_reason": (
+            None
+            if attack_scenarios
+            else text_or(
+                value.get("no_scenario_reason"),
+                "규칙 엔진이 연결 가능한 공격 시나리오 후보를 만들지 않았습니다.",
+            )
+        ),
+    }
+
+
+def _relaxed_known_refs(value: Any, expected_refs: set[str]) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if isinstance(item, str) and item in expected_refs and item not in result:
+            result.append(item)
+    return result
+
+
 def _report_json_schema(
     allowed_event_refs: list[str],
     *,
     allowed_scenario_event_sets: list[tuple[str, ...]] | None = None,
     allowed_scenario_contracts: list[dict[str, Any]] | None = None,
+    relaxed: bool = False,
 ) -> dict[str, Any]:
     scenario_contracts = allowed_scenario_contracts or []
     scenario_event_sets = (
@@ -797,9 +1814,9 @@ def _report_json_schema(
         "required": ["entity_type", "value", "event_refs"],
     }
     ref_dependent_max = {} if allowed_event_refs else {"maxItems": 0}
-    return {
+    schema = {
         "type": "object",
-        "additionalProperties": False,
+        "additionalProperties": relaxed,
         "properties": {
             "schema_version": {"type": "integer", "enum": [1]},
             "analysis_scope": {"type": "string", "minLength": 1},
@@ -807,8 +1824,14 @@ def _report_json_schema(
             "suspicious_events": {
                 "type": "array",
                 "items": suspicious_event_schema,
-                "minItems": len(allowed_event_refs),
-                "maxItems": len(allowed_event_refs),
+                **(
+                    {}
+                    if relaxed
+                    else {
+                        "minItems": len(allowed_event_refs),
+                        "maxItems": len(allowed_event_refs),
+                    }
+                ),
             },
             "major_findings": {
                 "type": "array",
@@ -823,8 +1846,14 @@ def _report_json_schema(
             "attack_scenarios": {
                 "type": "array",
                 "items": scenario_schema,
-                "minItems": len(scenario_event_sets),
-                "maxItems": len(scenario_event_sets),
+                **(
+                    {}
+                    if relaxed
+                    else {
+                        "minItems": len(scenario_event_sets),
+                        "maxItems": len(scenario_event_sets),
+                    }
+                ),
             },
             "related_entities": {
                 "type": "array",
@@ -859,6 +1888,9 @@ def _report_json_schema(
             "no_scenario_reason",
         ],
     }
+    if relaxed:
+        schema.pop("required", None)
+    return schema
 
 
 def _validate_structured_payload(
@@ -1004,7 +2036,11 @@ def _validate_structured_payload(
         label = f"related_entities[{index}]"
         if not isinstance(entity, dict):
             raise RuntimeError(f"구조화 {label}가 객체가 아닙니다.")
-        if entity.get("entity_type") not in {"account", "host", "ip", "process", "other"}:
+        entity_type = entity.get("entity_type")
+        if (
+            not isinstance(entity_type, str)
+            or entity_type not in {"account", "host", "ip", "process", "other"}
+        ):
             raise RuntimeError(f"{label}.entity_type이 올바르지 않습니다.")
         _required_text(entity, "value", label)
         _validated_ref_list(
@@ -1226,7 +2262,7 @@ def _required_text(value: dict[str, Any], key: str, label: str) -> str:
 
 
 def _validate_confidence(value: Any, label: str) -> None:
-    if value not in _CONFIDENCE_VALUES:
+    if not isinstance(value, str) or value not in _CONFIDENCE_VALUES:
         raise RuntimeError(f"{label}.confidence는 high, medium, low 중 하나여야 합니다.")
 
 
@@ -1516,8 +2552,8 @@ def _compact_json_for_llm(
         selection_truncated = selection_truncated or any(
             isinstance(finding, dict)
             and isinstance(finding.get("evidence"), list)
-            and len(finding["evidence"]) > 6
-            for finding in source_findings[:20]
+            and len(finding["evidence"]) > MAX_LM_EVIDENCE_PER_FINDING
+            for finding in source_findings[:MAX_LM_FINDINGS]
         )
     limits: dict[str, Any] = {
         "notice": "Values and collections may be truncated to fit the local model context.",
@@ -1782,9 +2818,11 @@ def _largest_prunable_dict(value: Any) -> dict[str, Any] | None:
 
 def _compact_for_llm(analysis: dict[str, Any]) -> dict[str, Any]:
     findings = []
-    for finding in analysis.get("findings", [])[:20]:
+    for finding in analysis.get("findings", [])[:MAX_LM_FINDINGS]:
         compact_finding = dict(finding)
-        compact_finding["evidence"] = finding.get("evidence", [])[:6]
+        compact_finding["evidence"] = finding.get("evidence", [])[
+            :MAX_LM_EVIDENCE_PER_FINDING
+        ]
         findings.append(compact_finding)
     suspicious_pool = _suspicious_events_for_llm(analysis)
     suspicious_events, scenario_candidates = _select_scenario_context_for_llm(
@@ -1802,7 +2840,7 @@ def _compact_for_llm(analysis: dict[str, Any]) -> dict[str, Any]:
             for candidate in scenario_candidates
             if isinstance(candidate, dict)
         ],
-        "timeline": analysis.get("timeline", [])[:80],
+        "timeline": analysis.get("timeline", [])[:MAX_LM_TIMELINE_EVENTS],
     }
 
 
@@ -1821,13 +2859,13 @@ def _suspicious_events_for_llm(analysis: dict[str, Any]) -> list[dict[str, Any]]
     findings = analysis.get("findings")
     if not isinstance(findings, list):
         return events
-    for finding in findings[:20]:
+    for finding in findings[:MAX_LM_FINDINGS]:
         if not isinstance(finding, dict):
             continue
         evidence_items = finding.get("evidence")
         if not isinstance(evidence_items, list):
             continue
-        for evidence in evidence_items[:6]:
+        for evidence in evidence_items[:MAX_LM_EVIDENCE_PER_FINDING]:
             if not isinstance(evidence, dict):
                 continue
             identity = _event_identity(evidence)
