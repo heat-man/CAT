@@ -224,7 +224,7 @@ select {
   border-radius: 8px;
   background: #eef1ef;
   object-fit: cover;
-  object-position: center;
+  object-position: center 10%;
 }
 
 input:focus,
