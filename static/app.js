@@ -8,6 +8,8 @@ const errorBox = document.querySelector("#errorBox");
 const reportView = document.querySelector("#reportView");
 const findingsView = document.querySelector("#findingsView");
 const summaryView = document.querySelector("#summaryView");
+const savePdfButton = document.querySelector("#savePdfButton");
+const tabList = document.querySelector(".tab-list");
 const healthStatus = document.querySelector("#healthStatus");
 const agentBackend = document.querySelector("#agentBackend");
 const lmUrl = document.querySelector("#lmUrl");
@@ -106,6 +108,9 @@ function formatBytes(value) {
 
 function setBusy(isBusy) {
   analyzeButton.disabled = isBusy;
+  if (savePdfButton) {
+    savePdfButton.disabled = isBusy || !String(lastReport || "").trim();
+  }
   loading.classList.toggle("hidden", !isBusy);
   if (isBusy) {
     startProgress();
@@ -173,7 +178,7 @@ form.addEventListener("submit", async (event) => {
       throw new Error(`${data.error || "분석 요청 실패"}${parserErrors}`);
     }
 
-    lastReport = data.report_markdown;
+    lastReport = String(data.report_markdown || "");
     lastAnalysis = resolveAnalysisPayload(data);
     renderReport(lastReport, data.llm, lastAnalysis);
     try {
@@ -198,6 +203,7 @@ fileInput.addEventListener("change", updateFileSummary);
 agentBackend?.addEventListener("change", updateAgentFields);
 lmUrl?.addEventListener("change", () => writePreference("cat.lm_url", lmUrl.value.trim()));
 lmModel?.addEventListener("change", () => writePreference("cat.lm_model", lmModel.value.trim()));
+savePdfButton?.addEventListener("click", saveReportAsPdf);
 
 for (const eventName of ["dragenter", "dragover"]) {
   fileDrop.addEventListener(eventName, (event) => {
@@ -221,14 +227,79 @@ fileDrop.addEventListener("drop", (event) => {
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => activateTab(button.dataset.tab));
 });
+tabList?.addEventListener("keydown", handleTabKeydown);
 
 function activateTab(name) {
   document.querySelectorAll(".tab").forEach((button) => {
-    button.classList.toggle("active", button.dataset.tab === name);
+    const selected = button.dataset.tab === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   });
   reportView.classList.toggle("hidden", name !== "report");
   findingsView.classList.toggle("hidden", name !== "findings");
   summaryView.classList.toggle("hidden", name !== "summary");
+}
+
+function handleTabKeydown(event) {
+  if (!tabList) return;
+  const buttons = [...tabList.querySelectorAll(".tab")];
+  const currentIndex = buttons.indexOf(document.activeElement);
+  if (currentIndex < 0) return;
+
+  let targetIndex;
+  if (event.key === "ArrowRight") targetIndex = (currentIndex + 1) % buttons.length;
+  else if (event.key === "ArrowLeft") {
+    targetIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+  }
+  else if (event.key === "Home") targetIndex = 0;
+  else if (event.key === "End") targetIndex = buttons.length - 1;
+  else return;
+
+  event.preventDefault();
+  const target = buttons[targetIndex];
+  activateTab(target.dataset.tab);
+  target.focus();
+}
+
+function saveReportAsPdf() {
+  if (!String(lastReport || "").trim()) {
+    showError("먼저 분석을 실행해 보고서를 생성하세요.");
+    return;
+  }
+  if (typeof window.print !== "function") {
+    showError("이 브라우저에서는 보고서 인쇄 기능을 사용할 수 없습니다.");
+    return;
+  }
+
+  clearError();
+  activateTab("report");
+  const originalTitle = document.title;
+  let titleRestored = false;
+  const restoreTitle = () => {
+    if (titleRestored) return;
+    titleRestored = true;
+    document.title = originalTitle;
+    window.removeEventListener("afterprint", restoreTitle);
+  };
+
+  document.title = buildReportPdfTitle(new Date());
+  window.addEventListener("afterprint", restoreTitle);
+  try {
+    window.print();
+  } catch {
+    showError("브라우저가 인쇄 창을 열지 못했습니다. 브라우저의 인쇄 정책을 확인하세요.");
+    restoreTitle();
+    return;
+  }
+  window.setTimeout(restoreTitle, 1000);
+}
+
+function buildReportPdfTitle(now) {
+  const pad = (value) => String(value).padStart(2, "0");
+  const date = [now.getFullYear(), pad(now.getMonth() + 1), pad(now.getDate())].join("");
+  const time = [pad(now.getHours()), pad(now.getMinutes()), pad(now.getSeconds())].join("");
+  return `CAT-report-${date}-${time}`;
 }
 
 function renderReport(markdown, llm, analysis = {}) {

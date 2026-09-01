@@ -71,10 +71,25 @@
       </section>
 
       <section class="result-panel" aria-label="분석 결과">
-        <div class="tabs" role="tablist">
-          <button class="tab active" data-tab="report" type="button">보고서</button>
-          <button class="tab" data-tab="findings" type="button">탐지 결과</button>
-          <button class="tab" data-tab="summary" type="button">요약</button>
+        <div class="tabs">
+          <div class="tab-list" role="tablist" aria-label="분석 결과 보기">
+            <button id="reportTab" class="tab active" data-tab="report" type="button" role="tab" aria-controls="reportView" aria-selected="true" tabindex="0">
+              보고서
+            </button>
+            <button id="findingsTab" class="tab" data-tab="findings" type="button" role="tab" aria-controls="findingsView" aria-selected="false" tabindex="-1">
+              탐지 결과
+            </button>
+            <button id="summaryTab" class="tab" data-tab="summary" type="button" role="tab" aria-controls="summaryView" aria-selected="false" tabindex="-1">
+              요약
+            </button>
+          </div>
+          <button
+            id="savePdfButton"
+            class="secondary"
+            type="button"
+            title="브라우저 인쇄 창에서 보고서를 PDF로 저장합니다."
+            disabled
+          >PDF로 저장</button>
         </div>
 
         <div id="loading" class="loading hidden">
@@ -87,13 +102,19 @@
 
         <div id="errorBox" class="error-box hidden"></div>
 
-        <article id="reportView" class="tab-view markdown-view">
+        <article
+          id="reportView"
+          class="tab-view markdown-view"
+          role="tabpanel"
+          aria-labelledby="reportTab"
+          tabindex="0"
+        >
           <div class="empty-state" aria-hidden="true">
             <img src="/asset/cat.jpg" alt="" />
           </div>
         </article>
-        <article id="findingsView" class="tab-view hidden"></article>
-        <article id="summaryView" class="tab-view hidden"></article>
+        <article id="findingsView" class="tab-view hidden" role="tabpanel" aria-labelledby="findingsTab" tabindex="0"></article>
+        <article id="summaryView" class="tab-view hidden" role="tabpanel" aria-labelledby="summaryTab" tabindex="0"></article>
       </section>
     </main>
 

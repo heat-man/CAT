@@ -260,6 +260,13 @@ select:focus {
   background: #fbfcfb;
 }
 
+.tab-list {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .tab {
   min-width: 92px;
 }
@@ -272,11 +279,9 @@ select:focus {
 }
 
 .tabs .secondary {
-  margin-left: 0;
-}
-
-.tabs .tab + .secondary {
+  flex: 0 0 auto;
   margin-left: auto;
+  white-space: nowrap;
 }
 
 .loading {
@@ -555,7 +560,19 @@ select:focus {
   }
 
   .tabs {
+    height: auto;
+    overflow: visible;
+    flex-wrap: wrap;
+  }
+
+  .tab-list {
+    flex: 1 1 100%;
     overflow-x: auto;
+  }
+
+  .tabs .secondary {
+    width: 100%;
+    margin-left: 0;
   }
 
   .loading {
@@ -573,5 +590,103 @@ select:focus {
 
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@page {
+  size: A4;
+  margin: 14mm;
+}
+
+@media print {
+  :root {
+    color-scheme: light;
+    font-family: "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", sans-serif;
+  }
+
+  html,
+  body {
+    min-height: 0;
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  body {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .app-header,
+  .input-panel,
+  .tabs,
+  .loading,
+  .error-box,
+  #findingsView,
+  #summaryView {
+    display: none !important;
+  }
+
+  .workspace {
+    display: block;
+    padding: 0;
+  }
+
+  .result-panel {
+    min-height: 0;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+  }
+
+  #reportView {
+    display: block !important;
+    height: auto;
+    overflow: visible;
+    padding: 0;
+  }
+
+  #reportView .empty-state {
+    display: none !important;
+  }
+
+  #reportView h1,
+  #reportView h2,
+  #reportView h3,
+  #reportView h4 {
+    break-after: avoid-page;
+    page-break-after: avoid;
+  }
+
+  #reportView p,
+  #reportView li {
+    orphans: 3;
+    widows: 3;
+  }
+
+  #reportView code,
+  #reportView pre,
+  #reportView td,
+  #reportView th {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+
+  #reportView table {
+    width: 100%;
+    break-inside: auto;
+    page-break-inside: auto;
+  }
+
+  #reportView tr,
+  #reportView .llm-warning,
+  #reportView .parser-warning {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  #reportView a {
+    color: inherit;
+    text-decoration: none;
   }
 }
