@@ -157,6 +157,29 @@ class LMRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(opted_in_payload["reasoning_effort"], "medium")
 
+    def test_strict_truncated_input_keeps_fixed_nine_report_sections(self) -> None:
+        analysis = _analysis()
+        analysis["scope"] = {"records_in_range": 10_000}
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_structured_completion([])),
+        ):
+            report, status = reporting.generate_report(
+                analysis,
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertTrue(status["structured_report_validated"])
+        self.assertTrue(status["input_truncated"])
+        self.assertNotIn("## CAT 입력 증거 범위", report)
+        self.assertIn("- CAT 입력 범위:", report)
+        for section in reporting.REQUIRED_REPORT_SECTIONS:
+            self.assertEqual(report.count(section), 1)
+
     def test_incomplete_completion_falls_back_to_rules(self) -> None:
         completion = {
             "choices": [
@@ -343,6 +366,7 @@ class LMRuntimeTests(unittest.TestCase):
             "file://192.168.100.20",
             "http://user:pass@192.168.100.20:1234",
             "http://192.168.100.20:1234/v1",
+            "http://192.168.100.20:1234/v1/chat/completions",
             "http://192.168.100.20:99999",
         ):
             with (
@@ -1246,6 +1270,8 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
             "CAT_ALLOW_CUSTOM_LM_URL",
             "CAT_BROWSER_ALLOWED_ORIGINS",
             "CAT_LM_STRICT_VALIDATION",
+            "CAT_LM_TIMEOUT_SECONDS",
+            "CAT_LM_MAX_INPUT_CHARS",
             "LM_STUDIO_URL",
         ):
             environment.pop(name, None)
@@ -1260,6 +1286,8 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                     "'host': server.DEFAULT_BIND_HOST, "
                     "'custom': server.ALLOW_CUSTOM_LM_URL, "
                     "'strict': reporting.DEFAULT_LM_STRICT_VALIDATION, "
+                    "'timeout': reporting.DEFAULT_LM_TIMEOUT_SECONDS, "
+                    "'max_input_chars': reporting.DEFAULT_LM_MAX_INPUT_CHARS, "
                     "'url': reporting.DEFAULT_LM_STUDIO_URL}))"
                 ),
             ],
@@ -1275,6 +1303,8 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         self.assertEqual(defaults["host"], "0.0.0.0")
         self.assertTrue(defaults["custom"])
         self.assertFalse(defaults["strict"])
+        self.assertEqual(defaults["timeout"], 900.0)
+        self.assertEqual(defaults["max_input_chars"], 48 * 1024)
         self.assertEqual(
             defaults["url"],
             "http://127.0.0.1:1234/v1/chat/completions",
@@ -1283,6 +1313,22 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         run_ps1 = (ROOT / "scripts" / "run.ps1").read_text(encoding="utf-8")
         self.assertIn("${HOST:-0.0.0.0}", run_sh)
         self.assertIn('else { "0.0.0.0" }', run_ps1)
+
+    def test_lm_timeout_override_is_bounded_without_changing_default(self) -> None:
+        _report, status = reporting.generate_report(
+            _analysis(),
+            use_llm=False,
+            lm_url=self.base_url,
+            model=self.model_id,
+            timeout_seconds=reporting.MAX_LM_TIMEOUT_SECONDS * 10,
+        )
+
+        self.assertEqual(reporting.MAX_LM_TIMEOUT_SECONDS, 7200.0)
+        self.assertEqual(
+            status["timeout_seconds"],
+            reporting.MAX_LM_TIMEOUT_SECONDS,
+        )
+        self.assertFalse(status["timed_out"])
 
     def test_relaxed_mode_repairs_model_differences_and_keeps_canonical_facts(self) -> None:
         structured = _structured_payload(
@@ -1320,7 +1366,6 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         self.assertFalse(status["structured_report_validated"])
         self.assertTrue(status["structured_report_recovered"])
         self.assertTrue(status["validation_warnings"])
-        self.assertIn("응답 보정 안내", report)
         self.assertIn("SCN-001", report)
         self.assertNotIn("SCN-999", report)
         self.assertNotIn("2099-01-01", report)
@@ -1345,10 +1390,72 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
 
         self.assertTrue(status["used"], status["error"])
         self.assertTrue(status["unstructured_report_used"])
-        self.assertIn("LM Studio 원문", report)
-        self.assertIn("정상 완료 결과", report)
+        self.assertEqual(
+            report,
+            "# LM Studio 분석\n\n- 추가 조사가 필요한 정상 완료 결과",
+        )
+        self.assertEqual(status["validation_warnings"], [])
 
-    def test_relaxed_mode_still_rejects_truncated_non_json_output(self) -> None:
+    def test_relaxed_mode_displays_plain_text_verbatim(self) -> None:
+        content = "PowerShell 의심 행위가 확인되었으며 원본 로그 확인이 필요합니다."
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content(content)),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, content)
+        self.assertTrue(status["unstructured_report_used"])
+
+    def test_relaxed_mode_keeps_markdown_wrapping_a_json_example_verbatim(self) -> None:
+        content = (
+            "# 자유 보고서\n\n"
+            "설명 전반부\n\n"
+            '{"analysis_scope":"범위","executive_summary":"요약"}\n\n'
+            "설명 후반부"
+        )
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content(content)),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, content)
+        self.assertTrue(status["unstructured_report_used"])
+        self.assertFalse(status["structured_report_recovered"])
+
+    def test_relaxed_mode_rejects_only_an_empty_report(self) -> None:
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content("   \n")),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertFalse(status["used"])
+        self.assertIn("빈 보고서를 반환했습니다", status["error"])
+        self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+
+    def test_relaxed_mode_keeps_nonempty_output_even_if_finish_reason_is_length(self) -> None:
         completion = {
             "choices": [
                 {
@@ -1369,11 +1476,52 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                 model=self.model_id,
             )
 
-        self.assertFalse(status["used"])
-        self.assertIn("출력 한도에서 잘렸", status["error"])
-        self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, "truncated")
+        self.assertTrue(status["completion_incomplete"])
+        self.assertTrue(status["validation_warnings"])
 
-    def test_relaxed_mode_does_not_synthesize_truncated_json_fragment(self) -> None:
+    def test_relaxed_mode_keeps_nonempty_unclosed_thinking_text(self) -> None:
+        content = "<think>추론 태그가 닫히지 않았지만 응답은 비어 있지 않습니다."
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content(content)),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, content)
+        self.assertTrue(status["unstructured_report_used"])
+        self.assertFalse(status["thinking_content_removed"])
+        self.assertTrue(status["validation_warnings"])
+
+    def test_relaxed_mode_keeps_thinking_only_content(self) -> None:
+        content = "<think>추가 확인이 필요한 추론</think>"
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content(content)),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, content)
+        self.assertTrue(status["unstructured_report_used"])
+        self.assertFalse(status["thinking_content_removed"])
+        self.assertTrue(status["validation_warnings"])
+
+    def test_relaxed_mode_keeps_partial_json_for_any_nonempty_completion(self) -> None:
         for finish_reason in (
             "length",
             "content_filter",
@@ -1412,9 +1560,9 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                         model=self.model_id,
                     )
 
-                self.assertFalse(status["used"])
-                self.assertIn("완전한 구조화 보고서", status["error"])
-                self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+                self.assertTrue(status["used"], status["error"])
+                self.assertEqual(report, '{"analysis_scope":"부분 응답"}')
+                self.assertTrue(status["completion_incomplete"])
 
     def test_relaxed_mode_repairs_malformed_nested_json_types(self) -> None:
         structured = _structured_payload(
@@ -1443,7 +1591,7 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         self.assertIn("EVT-0001", report)
         self.assertIn("SCN-001", report)
 
-    def test_relaxed_mode_rejects_unhashable_finish_reason_and_empty_sections(self) -> None:
+    def test_relaxed_mode_accepts_nonempty_json_with_unusual_finish_reason(self) -> None:
         fragments = (
             '{"recommendations":[]}',
             '{"major_findings":[{"event_refs":[123]}]}',
@@ -1475,9 +1623,9 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                         model=self.model_id,
                     )
 
-                self.assertFalse(status["used"])
-                self.assertIn("완전한 구조화 보고서", status["error"])
-                self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+                self.assertTrue(status["used"], status["error"])
+                self.assertEqual(report, content)
+                self.assertTrue(status["unstructured_report_used"])
 
     def test_relaxed_mode_requires_retained_model_content_for_recovery(self) -> None:
         fragments = (
@@ -1514,7 +1662,7 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                 self.assertTrue(status["used"], status["error"])
                 self.assertTrue(status["unstructured_report_used"])
                 self.assertFalse(status["structured_report_recovered"])
-                self.assertIn("LM Studio 원문", report)
+                self.assertEqual(report, content)
 
     def test_relaxed_mode_keeps_substantive_later_duplicates(self) -> None:
         structured = _structured_payload(
@@ -1672,19 +1820,12 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                 "secret-token",
             )
 
-    def test_relaxed_mode_retries_when_json_schema_is_not_supported(self) -> None:
-        schema_error = reporting.HTTPError(
-            f"{self.base_url}/v1/chat/completions",
-            400,
-            "Bad Request",
-            hdrs=None,
-            fp=io.BytesIO(b'{"error":"unsupported response_format"}'),
-        )
+    def test_relaxed_mode_accepts_full_schema_without_requesting_schema(self) -> None:
         completion = _structured_completion([])
         with mock.patch.object(
             reporting,
             "open_lm_request",
-            side_effect=[schema_error, _FakeResponse(completion)],
+            return_value=_FakeResponse(completion),
         ) as open_request:
             report, status = reporting.generate_report(
                 _analysis(),
@@ -1694,40 +1835,34 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
             )
 
         self.assertTrue(status["used"], status["error"])
-        self.assertEqual(open_request.call_count, 2)
-        retry_request = open_request.call_args_list[1].args[0]
-        retry_payload = json.loads(retry_request.data.decode("utf-8"))
-        self.assertEqual(retry_payload["response_format"], {"type": "json_object"})
-        self.assertNotIn("top_k", retry_payload)
+        self.assertTrue(status["structured_report_validated"])
+        self.assertEqual(open_request.call_count, 1)
+        sent_payload = json.loads(open_request.call_args.args[0].data.decode("utf-8"))
+        self.assertNotIn("response_format", sent_payload)
         self.assertEqual(
-            retry_payload["chat_template_kwargs"],
+            sent_payload["chat_template_kwargs"],
             {"enable_thinking": False},
         )
-        self.assertTrue(status["validation_warnings"])
+        prompt = sent_payload["messages"][1]["content"]
+        self.assertIn("Markdown 형식의 자유로운 보고서", prompt)
+        self.assertNotIn("response_format JSON schema", prompt)
+        self.assertNotIn("구조화 응답 규칙", prompt)
         self.assertIn("Qwen 침해 로그 분석 보고서", report)
 
-    def test_relaxed_mode_retries_without_response_format_when_needed(self) -> None:
-        first_error = reporting.HTTPError(
+    def test_relaxed_compatibility_retry_never_adds_response_format(self) -> None:
+        parameter_error = reporting.HTTPError(
             f"{self.base_url}/v1/chat/completions",
             400,
             "Bad Request",
             hdrs=None,
-            fp=io.BytesIO(b'{"error":"unsupported json_schema"}'),
-        )
-        second_error = reporting.HTTPError(
-            f"{self.base_url}/v1/chat/completions",
-            422,
-            "Unprocessable Entity",
-            hdrs=None,
-            fp=io.BytesIO(b'{"error":"unsupported json_object"}'),
+            fp=io.BytesIO(b'{"error":"unsupported parameter: top_k"}'),
         )
         with mock.patch.object(
             reporting,
             "open_lm_request",
             side_effect=[
-                first_error,
-                second_error,
-                _FakeResponse(_structured_completion([])),
+                parameter_error,
+                _FakeResponse(_completion_with_content("호환 재시도 보고서")),
             ],
         ) as open_request:
             report, status = reporting.generate_report(
@@ -1738,16 +1873,259 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
             )
 
         self.assertTrue(status["used"], status["error"])
-        self.assertEqual(open_request.call_count, 3)
-        final_request = open_request.call_args_list[2].args[0]
-        final_payload = json.loads(final_request.data.decode("utf-8"))
-        self.assertNotIn("response_format", final_payload)
-        self.assertEqual(
-            final_payload["chat_template_kwargs"],
-            {"enable_thinking": False},
+        self.assertEqual(report, "호환 재시도 보고서")
+        self.assertEqual(open_request.call_count, 2)
+        first_payload = json.loads(open_request.call_args_list[0].args[0].data)
+        retry_payload = json.loads(open_request.call_args_list[1].args[0].data)
+        self.assertNotIn("response_format", first_payload)
+        self.assertNotIn("response_format", retry_payload)
+        self.assertIn("top_k", first_payload)
+        self.assertNotIn("top_k", retry_payload)
+        self.assertTrue(status["validation_warnings"])
+
+    def test_relaxed_mode_accepts_partial_json_without_required_sections(self) -> None:
+        partial = {
+            "summary": "PowerShell 의심 행위 확인",
+            "findings": ["EncodedCommand 실행"],
+        }
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(
+                _completion_with_content(json.dumps(partial, ensure_ascii=False))
+            ),
+        ) as open_request:
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(open_request.call_count, 1)
+        self.assertTrue(status["unstructured_report_used"])
+        self.assertFalse(status["structured_report_recovered"])
+        self.assertEqual(status["validation_warnings"], [])
+        self.assertIn("PowerShell 의심 행위 확인", report)
+        self.assertIn("EncodedCommand 실행", report)
+
+    def test_relaxed_mode_keeps_excessively_nested_json_as_text(self) -> None:
+        depth = sys.getrecursionlimit() + 50
+        content = "[" * depth + "0" + "]" * depth
+        with mock.patch.object(
+            reporting,
+            "open_lm_request",
+            return_value=_FakeResponse(_completion_with_content(content)),
+        ):
+            report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        self.assertTrue(status["used"], status["error"])
+        self.assertEqual(report, content)
+        self.assertTrue(status["unstructured_report_used"])
+
+    def test_large_analysis_is_evidence_first_and_bounded(self) -> None:
+        analysis = _analysis()
+        analysis["scope"] = {"records_in_range": 20_000}
+        analysis["suspicious_events"] = [
+            {
+                "event_ref": f"EVT-{index:04d}",
+                "time": f"2026-08-01T00:{index % 60:02d}:00Z",
+                "event_id": "1",
+                "provider": "Microsoft-Windows-Sysmon",
+                "channel": "Microsoft-Windows-Sysmon/Operational",
+                "host": "WIN-01",
+                "process": "health-agent.exe",
+                "command_line": "health-agent.exe --heartbeat " + "X" * 1000,
+                "severity": "low",
+                "confidence": "low",
+                "rule_ids": ["repeated-sysmon"],
+            }
+            for index in range(1, 301)
+        ]
+        analysis["timeline"] = [
+            {
+                "time": f"2026-08-01T00:{index % 60:02d}:00Z",
+                "type": "event",
+                "severity": "info",
+                "title": "Event ID 1",
+                "event_id": "1",
+                "host": "WIN-01",
+            }
+            for index in range(300)
+        ]
+
+        with (
+            mock.patch.multiple(
+                reporting,
+                DEFAULT_LM_MAX_INPUT_CHARS=8192,
+                DEFAULT_LM_MAX_FIELD_CHARS=512,
+                MAX_LM_SUSPICIOUS_EVENTS=30,
+            ),
+            mock.patch.object(
+                reporting,
+                "open_lm_request",
+                return_value=_FakeResponse(
+                    _completion_with_content("반복 이벤트를 축약한 자유 형식 보고서")
+                ),
+            ) as open_request,
+        ):
+            report, status = reporting.generate_report(
+                analysis,
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+            )
+
+        payload = json.loads(open_request.call_args.args[0].data.decode("utf-8"))
+        compact_json = payload["messages"][1]["content"].split(
+            "CAT_ANALYSIS_JSON:\n",
+            1,
+        )[1]
+        compact = json.loads(compact_json)
+        self.assertLessEqual(len(compact_json), 8192)
+        self.assertTrue(status["used"], status["error"])
+        self.assertTrue(status["input_truncated"])
+        self.assertEqual(status["input_source_records"], 20_000)
+        self.assertEqual(status["input_source_suspicious_events"], 300)
+        self.assertLessEqual(status["input_suspicious_events"], 4)
+        self.assertLessEqual(len(compact["timeline"]), 3)
+        self.assertIn("일부만 LM Studio에 제공", status["input_limitation"])
+        self.assertIn("CAT 입력 증거 범위", report)
+        self.assertIn(
+            "_input_limits.truncated가 true",
+            payload["messages"][1]["content"],
         )
-        self.assertGreaterEqual(len(status["validation_warnings"]), 2)
-        self.assertIn("Qwen 침해 로그 분석 보고서", report)
+
+    def test_network_evidence_is_preserved_and_prioritized_for_lm(self) -> None:
+        analysis = _analysis()
+        analysis["scope"] = {"records_in_range": 1}
+        analysis["suspicious_events"] = [
+            {
+                "event_ref": "EVT-0001",
+                "time": "2026-09-01T01:02:03Z",
+                "event_id": "3",
+                "provider": "Microsoft-Windows-Sysmon",
+                "channel": "Microsoft-Windows-Sysmon/Operational",
+                "host": "WIN-01",
+                "source_ip": "10.0.0.5",
+                "source_port": "55123",
+                "destination_ip": "203.0.113.50",
+                "destination_port": "4444",
+                "destination_hostname": "c2.example",
+                "protocol": "tcp",
+                "process": r"C:\Users\Public\odd.exe",
+                "process_guid": "{11111111-1111-1111-1111-111111111111}",
+                "severity": "high",
+                "confidence": "high",
+                "rule_ids": ["suspicious_network_connection"],
+            }
+        ]
+
+        compact_json, metadata = reporting._compact_json_for_llm(analysis)
+        compact = json.loads(compact_json)
+        event = compact["suspicious_events"][0]
+
+        self.assertFalse(metadata["input_truncated"])
+        self.assertEqual(event["destination_ip"], "203.0.113.50")
+        self.assertEqual(event["destination_port"], "4444")
+        self.assertEqual(event["destination_hostname"], "c2.example")
+        self.assertEqual(event["process_guid"], analysis["suspicious_events"][0]["process_guid"])
+        self.assertIn("dst_ip=203.0.113.50", event["observation"])
+        self.assertIn("dst_port=4444", event["observation"])
+        self.assertIn("dst_host=c2.example", event["observation"])
+
+    def test_structured_related_entities_accept_observed_network_values(self) -> None:
+        facts = {
+            "EVT-0001": {
+                "source_ip": "10.0.0.5",
+                "destination_ip": "203.0.113.50",
+                "destination_port": "4444",
+                "destination_hostname": "c2.example",
+            }
+        }
+
+        self.assertTrue(
+            reporting._entity_value_is_observed(
+                "ip", "203.0.113.50", ["EVT-0001"], facts
+            )
+        )
+        self.assertTrue(
+            reporting._entity_value_is_observed(
+                "domain", "c2.example", ["EVT-0001"], facts
+            )
+        )
+        self.assertTrue(
+            reporting._entity_value_is_observed(
+                "port", "4444", ["EVT-0001"], facts
+            )
+        )
+        entity_types = reporting._report_json_schema(["EVT-0001"])["properties"][
+            "related_entities"
+        ]["items"]["properties"]["entity_type"]["enum"]
+        self.assertIn("domain", entity_types)
+        self.assertIn("port", entity_types)
+
+    def test_structured_input_limitation_keeps_nine_section_contract(self) -> None:
+        report = "\n\n".join(
+            f"{section}\n- 기존 내용" for section in reporting.REQUIRED_REPORT_SECTIONS
+        )
+        limitation = "전체 이벤트 중 일부 대표 근거만 제공되었습니다."
+
+        updated = reporting._append_input_limitation(
+            report,
+            limitation,
+            structured_report=True,
+        )
+
+        self.assertNotIn("## CAT 입력 증거 범위", updated)
+        self.assertIn(f"- CAT 입력 범위: {limitation}", updated)
+        self.assertLess(
+            updated.index(f"- CAT 입력 범위: {limitation}"),
+            updated.index(reporting.REQUIRED_REPORT_SECTIONS[8]),
+        )
+        for section in reporting.REQUIRED_REPORT_SECTIONS:
+            self.assertEqual(updated.count(section), 1)
+
+    def test_lm_timeout_status_contains_safe_request_diagnostics(self) -> None:
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_API_KEY", "do-not-log-this"),
+            mock.patch.object(
+                reporting,
+                "_read_lm_response",
+                side_effect=reporting._LMStudioTimeoutError("synthetic timeout"),
+            ),
+            self.assertLogs(reporting.LOGGER, level="WARNING") as captured,
+        ):
+            _report, status = reporting.generate_report(
+                _analysis(),
+                use_llm=True,
+                lm_url=self.base_url,
+                model=self.model_id,
+                timeout_seconds=1,
+            )
+
+        self.assertFalse(status["used"])
+        self.assertTrue(status["timed_out"])
+        self.assertEqual(status["timeout_model"], self.model_id)
+        self.assertGreater(status["timeout_input_chars"], 0)
+        self.assertGreaterEqual(status["timeout_elapsed_seconds"], 0)
+        self.assertEqual(
+            status["timeout_endpoint"],
+            f"{self.base_url}/v1/chat/completions",
+        )
+        self.assertNotIn("do-not-log-this", status["error"])
+        timeout_log = "\n".join(captured.output)
+        self.assertIn(f"model='{self.model_id}'", timeout_log)
+        self.assertIn("input_chars=", timeout_log)
+        self.assertIn("elapsed_seconds=", timeout_log)
+        self.assertIn(f"endpoint='{self.base_url}/v1/chat/completions'", timeout_log)
+        self.assertNotIn("do-not-log-this", timeout_log)
 
     def test_relaxed_mode_does_not_retry_a_missing_endpoint(self) -> None:
         not_found = reporting.HTTPError(

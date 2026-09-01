@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from math import isfinite
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from .models import EventRecord, ParseResult
 from .timeutil import parse_event_time
 
 EVENT_NS = "http://schemas.microsoft.com/win/2004/08/events/event"
+LOGGER = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -106,13 +108,34 @@ MAX_XML_ELEMENTS_PER_FILE = _env_int(
     "CAT_XML_MAX_ELEMENTS_PER_FILE", 5_000_000, minimum=1000, maximum=20_000_000
 )
 MAX_XML_DEPTH = _env_int("CAT_XML_MAX_DEPTH", 128, minimum=16, maximum=1024)
-XML_PARSE_TIMEOUT_SECONDS = _env_float(
-    "CAT_XML_PARSE_TIMEOUT_SECONDS", 60.0, minimum=1.0, maximum=1800.0
-)
+DEFAULT_XML_PARSE_TIMEOUT_SECONDS = 300.0
+MAX_XML_PARSE_TIMEOUT_SECONDS = 1800.0
+
+
+def _xml_parse_timeout_seconds() -> float:
+    return _env_float(
+        "CAT_XML_PARSE_TIMEOUT_SECONDS",
+        DEFAULT_XML_PARSE_TIMEOUT_SECONDS,
+        minimum=1.0,
+        maximum=MAX_XML_PARSE_TIMEOUT_SECONDS,
+    )
+
+
+XML_PARSE_TIMEOUT_SECONDS = _xml_parse_timeout_seconds()
 
 
 class XMLLimitError(ValueError):
     pass
+
+
+class XMLParseTimeoutError(TimeoutError):
+    """Timeout carrying elapsed time for higher-level parser diagnostics."""
+
+    def __init__(self, elapsed_seconds: float) -> None:
+        self.elapsed_seconds = max(0.0, elapsed_seconds)
+        super().__init__(
+            f"XML parsing exceeded {XML_PARSE_TIMEOUT_SECONDS:g} seconds"
+        )
 
 
 class _ExtractionBudget:
@@ -412,10 +435,14 @@ class _StreamingEventTarget(ET.TreeBuilder):
 
 
 def _check_xml_deadline(deadline: float) -> None:
-    if time.monotonic() > deadline:
-        raise TimeoutError(
-            f"XML parsing exceeded {XML_PARSE_TIMEOUT_SECONDS:g} seconds"
-        )
+    now = time.monotonic()
+    if now > deadline:
+        # All parser deadlines are created as start + configured timeout. This
+        # reconstructs the actual elapsed duration without another clock read,
+        # which keeps diagnostics reliable even when the timeout is raised deep
+        # inside an incremental parser callback.
+        started_at = deadline - XML_PARSE_TIMEOUT_SECONDS
+        raise XMLParseTimeoutError(now - started_at)
 
 try:
     from Evtx.Evtx import Evtx
@@ -440,12 +467,14 @@ def parse_event_files(
     total_in_range = 0
     truncated = False
     stop_after_limit = False
-    parse_deadline = time.monotonic() + XML_PARSE_TIMEOUT_SECONDS
+    parse_started_at = time.monotonic()
+    parse_deadline = parse_started_at + XML_PARSE_TIMEOUT_SECONDS
     retention_budget = _RetentionBudget()
 
     for path in paths:
         before_seen = total_seen
         before_range = total_in_range
+        before_records = len(records)
         file_error: str | None = None
         try:
             iterator = (
@@ -467,6 +496,45 @@ def parse_event_files(
         except EvtxDependencyError as exc:
             file_error = str(exc)
             errors.append(f"{path.name}: {exc}")
+        except TimeoutError as exc:
+            elapsed_seconds = getattr(exc, "elapsed_seconds", None)
+            if elapsed_seconds is None:
+                try:
+                    elapsed_seconds = max(0.0, time.monotonic() - parse_started_at)
+                except Exception:
+                    # A custom/test clock can be exhausted. The configured
+                    # timeout is still a conservative and useful fallback.
+                    elapsed_seconds = XML_PARSE_TIMEOUT_SECONDS
+            try:
+                file_size_bytes: int | str = path.stat().st_size
+            except OSError:
+                file_size_bytes = "unknown"
+            parsed_events = total_seen - before_seen
+            in_range_events = total_in_range - before_range
+            retained_events = len(records) - before_records
+            detail = (
+                f"{exc} (file_size_bytes={file_size_bytes}, "
+                f"parsed_events={parsed_events}, "
+                f"in_range_events={in_range_events}, "
+                f"retained_events={retained_events}, "
+                f"elapsed_seconds={elapsed_seconds:.3f})"
+            )
+            # Keep the historical error category stable even though the
+            # internal exception carries richer elapsed-time metadata.
+            file_error = f"TimeoutError: {detail}"
+            errors.append(f"{path.name}: {file_error}")
+            LOGGER.warning(
+                "XML parsing timeout file=%s file_size_bytes=%s "
+                "parsed_events=%d in_range_events=%d retained_events=%d "
+                "elapsed_seconds=%.3f",
+                path.name,
+                file_size_bytes,
+                parsed_events,
+                in_range_events,
+                retained_events,
+                elapsed_seconds,
+            )
+            truncated = True
         except Exception as exc:
             file_error = f"{type(exc).__name__}: {exc}"
             errors.append(f"{path.name}: {file_error}")

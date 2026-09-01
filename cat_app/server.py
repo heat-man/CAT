@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .analyzer import analyze_events
-from .evtx_reader import parse_event_files
+from .evtx_reader import XML_PARSE_TIMEOUT_SECONDS, parse_event_files
 from .reporting import (
     DEFAULT_LM_MAX_FIELD_CHARS,
     DEFAULT_LM_MAX_INPUT_CHARS,
@@ -37,6 +37,7 @@ from .reporting import (
     MAX_LM_SCENARIO_CANDIDATES,
     MAX_LM_SUSPICIOUS_EVENTS,
     MAX_LM_TIMELINE_EVENTS,
+    MAX_LM_TIMEOUT_SECONDS,
     generate_codex_dev_report,
     generate_report,
     generate_rule_report,
@@ -261,6 +262,7 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                     "lm_strict_validation": DEFAULT_LM_STRICT_VALIDATION,
                     "lm_limits": {
                         "timeout_seconds": DEFAULT_LM_TIMEOUT_SECONDS,
+                        "max_timeout_seconds": MAX_LM_TIMEOUT_SECONDS,
                         "max_tokens": DEFAULT_LM_MAX_TOKENS,
                         "max_response_bytes": DEFAULT_LM_MAX_RESPONSE_BYTES,
                         "max_input_chars": DEFAULT_LM_MAX_INPUT_CHARS,
@@ -274,6 +276,7 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                     "codex_dev_enabled": CODEX_DEV_ENABLED,
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "upload_timeout_seconds": DEFAULT_UPLOAD_TIMEOUT_SECONDS,
+                    "xml_parse_timeout_seconds": XML_PARSE_TIMEOUT_SECONDS,
                     "http_header_timeout_seconds": DEFAULT_HTTP_HEADER_TIMEOUT_SECONDS,
                     "response_write_timeout_seconds": DEFAULT_RESPONSE_WRITE_TIMEOUT_SECONDS,
                     "max_connections": DEFAULT_MAX_CONNECTIONS,
@@ -441,15 +444,31 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 )
                 llm_status["backend"] = agent_backend
                 llm_status["codex_review_required"] = False
+            report_log_fields: dict[str, Any] = {
+                "backend": agent_backend,
+                "llm_used": llm_status.get("used"),
+                "llm_error": bool(llm_status.get("error")),
+            }
+            if llm_status.get("timed_out") is True:
+                # Log only the bounded diagnostics created by the LM timeout
+                # path. Never serialize the request body, evidence, HTTP error
+                # response, Authorization header, or API key.
+                report_log_fields.update(
+                    {
+                        "lm_timed_out": True,
+                        "lm_model": _safe_log_text(llm_status.get("timeout_model")),
+                        "lm_input_chars": llm_status.get("timeout_input_chars"),
+                        "lm_elapsed_seconds": llm_status.get("timeout_elapsed_seconds"),
+                        "lm_endpoint": _safe_log_text(llm_status.get("timeout_endpoint")),
+                    }
+                )
             _mark_stage(
                 request_id,
                 request_start,
                 checkpoint,
                 timings,
                 "report",
-                backend=agent_backend,
-                llm_used=llm_status.get("used"),
-                llm_error=bool(llm_status.get("error")),
+                **report_log_fields,
             )
 
             _cleanup_temp_context(
@@ -971,6 +990,14 @@ def _stage_log(request_id: str, request_start: float, stage: str, **fields: Any)
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     suffix = f" {details}" if details else ""
     print(f"[CAT][{request_id}] {stage} elapsed={elapsed:.1f}s{suffix}", flush=True)
+
+
+def _safe_log_text(value: Any, maximum: int = 512) -> str | None:
+    if value is None:
+        return None
+    text = str(value).replace("\x00", "")[:maximum]
+    # JSON quoting keeps control characters from creating forged log lines.
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _rounded_timings(timings: dict[str, float], request_start: float) -> dict[str, float]:

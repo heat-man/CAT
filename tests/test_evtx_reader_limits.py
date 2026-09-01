@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -22,6 +23,20 @@ class XMLReaderLimitTests(unittest.TestCase):
         path = Path(directory) / "events.xml"
         path.write_text(content, encoding="utf-8")
         return path
+
+    def test_xml_parse_timeout_default_override_and_maximum(self) -> None:
+        self.assertEqual(evtx_reader.DEFAULT_XML_PARSE_TIMEOUT_SECONDS, 300.0)
+        self.assertEqual(evtx_reader.MAX_XML_PARSE_TIMEOUT_SECONDS, 1800.0)
+        with mock.patch.dict(
+            os.environ,
+            {"CAT_XML_PARSE_TIMEOUT_SECONDS": "900"},
+        ):
+            self.assertEqual(evtx_reader._xml_parse_timeout_seconds(), 900.0)
+        with mock.patch.dict(
+            os.environ,
+            {"CAT_XML_PARSE_TIMEOUT_SECONDS": "9999"},
+        ):
+            self.assertEqual(evtx_reader._xml_parse_timeout_seconds(), 1800.0)
 
     def test_xml_stream_does_not_reparse_serialized_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -258,13 +273,20 @@ class XMLReaderLimitTests(unittest.TestCase):
             mock.patch.object(evtx_reader, "Evtx", FakeEvtx),
             mock.patch.object(evtx_reader, "XML_PARSE_TIMEOUT_SECONDS", 0.05),
             mock.patch.object(evtx_reader.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertLogs(evtx_reader.LOGGER, level="WARNING"),
         ):
             path = Path(directory) / "events.evtx"
+            path.write_bytes(b"evtx")
             result = evtx_reader.parse_event_files([path], None, None, 10)
 
         self.assertEqual(result.total_seen, 1)
         self.assertTrue(result.truncated)
         self.assertIn("XML parsing exceeded 0.05 seconds", result.errors[0])
+        self.assertIn("file_size_bytes=4", result.errors[0])
+        self.assertIn("parsed_events=1", result.errors[0])
+        self.assertIn("in_range_events=1", result.errors[0])
+        self.assertIn("retained_events=1", result.errors[0])
+        self.assertIn("elapsed_seconds=0.060", result.errors[0])
 
     def test_deep_user_data_is_flattened_without_python_recursion(self) -> None:
         nested = "value"
@@ -358,14 +380,22 @@ class XMLReaderLimitTests(unittest.TestCase):
     def test_xml_deadline_is_absolute_across_parse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self._write(directory, f"<Events>{_event(1)}</Events>")
+            file_size = path.stat().st_size
             with (
                 mock.patch.object(evtx_reader, "XML_PARSE_TIMEOUT_SECONDS", 1.0),
                 mock.patch.object(evtx_reader.time, "monotonic", side_effect=[0.0, 2.0]),
+                self.assertLogs(evtx_reader.LOGGER, level="WARNING") as captured,
             ):
                 result = evtx_reader.parse_event_files([path], None, None, 10)
 
         self.assertEqual(result.records, [])
         self.assertIn("XML parsing exceeded 1 seconds", result.errors[0])
+        self.assertIn(f"file_size_bytes={file_size}", result.errors[0])
+        self.assertIn("parsed_events=0", result.errors[0])
+        self.assertIn("in_range_events=0", result.errors[0])
+        self.assertIn("retained_events=0", result.errors[0])
+        self.assertIn("elapsed_seconds=2.000", result.errors[0])
+        self.assertIn("XML parsing timeout file=events.xml", captured.output[0])
 
 
 if __name__ == "__main__":

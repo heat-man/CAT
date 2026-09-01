@@ -125,7 +125,7 @@ $env:CAT_LM_STRICT_VALIDATION = "false"
 .\.venv\Scripts\python.exe .\scripts\check_lmstudio.py
 ```
 
-마지막 명령은 웹의 완화 모드와 별개로 Chat Completions와 strict JSON Schema 승인 검사를 수행합니다. `EVT-0001`과 `EVT-0002`를 순서대로 연결한 2단계 시나리오뿐 아니라 원본 시각·관측값, 참조 무결성, 증거 한계, 9개 고정 보고서 섹션을 모두 확인합니다. 단순 문자열 또는 축약형 schema만 성공한 경우에는 strict 운용 승인을 내리지 않습니다. API 인증을 사용하면 실행 전에 키를 설정합니다.
+마지막 명령은 웹의 기본 자유 형식 모드와 별개로 Chat Completions와 strict JSON Schema 승인 검사를 수행합니다. `EVT-0001`과 `EVT-0002`를 순서대로 연결한 2단계 시나리오뿐 아니라 원본 시각·관측값, 참조 무결성, 증거 한계, 9개 고정 보고서 섹션을 모두 확인합니다. 단순 문자열 또는 축약형 schema만 성공한 경우에는 strict 운용 승인을 내리지 않습니다. API 인증을 사용하면 실행 전에 키를 설정합니다.
 
 ```powershell
 $env:LM_STUDIO_API_KEY = "<내부에서 발급한 키>"
@@ -149,7 +149,7 @@ loopback에서만 제공하려면 bind를 명시적으로 제한합니다.
 .\scripts\run.ps1 -BindHost 127.0.0.1 -Port 8000
 ```
 
-`0.0.0.0` 기본값을 유지할 때는 Windows 방화벽 원본 IP 제한, 역방향 프록시 인증, TLS, 업로드 로그 접근 통제를 별도로 구성합니다. CAT는 느린 업로드가 분석 실행을 무기한 막지 않도록 본문 수신과 multipart 처리를 합쳐 기본 900초(`CAT_UPLOAD_TIMEOUT_SECONDS`, 10~7200초)로 제한합니다. 요청 라인/헤더에는 15초 절대 제한을 적용하고 동시 연결은 32개로 제한합니다. 분석 중에는 다음 업로드를 본문 수신 전에 거부하며, 응답 쓰기는 60초·동시 대용량 응답은 2개로 제한합니다. 관련 값은 `CAT_HTTP_HEADER_TIMEOUT_SECONDS`, `CAT_MAX_CONNECTIONS`, `CAT_RESPONSE_WRITE_TIMEOUT_SECONDS`, `CAT_MAX_LARGE_RESPONSES`로 조정할 수 있습니다. 업로드는 메모리 대신 임시 파일로 스트리밍되며 multipart 분리 중 업로드 크기의 최대 약 2배에 해당하는 임시 디스크 여유가 필요합니다. XML은 스트리밍으로 읽고 파일·이벤트·텍스트·raw XML·깊이·요소 수와 60초 절대 파싱 예산을 적용합니다. EVTX는 레코드 변환 단계 사이마다 같은 누적 예산을 검사합니다. 필요 시 `CAT_XML_MAX_*` 및 `CAT_XML_PARSE_TIMEOUT_SECONDS`를 VM 메모리와 승인 입력 규모에 맞춰 조정합니다. 역방향 프록시의 request/read timeout은 기본 `CAT_LM_TIMEOUT_SECONDS=900`보다 길게 설정해야 LM Studio 완료 후 브라우저 연결이 먼저 끊어지지 않습니다.
+`0.0.0.0` 기본값을 유지할 때는 Windows 방화벽 원본 IP 제한, 역방향 프록시 인증, TLS, 업로드 로그 접근 통제를 별도로 구성합니다. CAT는 느린 업로드가 분석 실행을 무기한 막지 않도록 본문 수신과 multipart 처리를 합쳐 기본 900초(`CAT_UPLOAD_TIMEOUT_SECONDS`, 10~7200초)로 제한합니다. 요청 라인/헤더에는 15초 절대 제한을 적용하고 동시 연결은 32개로 제한합니다. 분석 중에는 다음 업로드를 본문 수신 전에 거부하며, 응답 쓰기는 60초·동시 대용량 응답은 2개로 제한합니다. 관련 값은 `CAT_HTTP_HEADER_TIMEOUT_SECONDS`, `CAT_MAX_CONNECTIONS`, `CAT_RESPONSE_WRITE_TIMEOUT_SECONDS`, `CAT_MAX_LARGE_RESPONSES`로 조정할 수 있습니다. 업로드는 메모리 대신 임시 파일로 스트리밍되며 multipart 분리 중 업로드 크기의 최대 약 2배에 해당하는 임시 디스크 여유가 필요합니다. XML은 스트리밍으로 읽고 파일·이벤트·텍스트·raw XML·깊이·요소 수와 기본 300초 절대 파싱 예산을 적용합니다. EVTX는 레코드 변환 단계 사이마다 같은 누적 예산을 검사합니다. timeout 오류와 로그에는 파일 크기, 파싱·범위·보관 이벤트 수와 경과시간이 포함됩니다. 필요 시 `CAT_XML_MAX_*` 및 `CAT_XML_PARSE_TIMEOUT_SECONDS`를 최대 1800초의 승인 범위 안에서 조정합니다. 역방향 프록시의 request/read timeout은 업로드·파싱·기본 `CAT_LM_TIMEOUT_SECONDS=900`의 LM 호출·응답 전송을 합친 전체 분석 예상 시간보다 길게 설정해야 합니다.
 
 ## 7. Windows 독립망 E2E 승인 체크리스트
 
@@ -175,7 +175,8 @@ loopback에서만 제공하려면 bind를 명시적으로 제한합니다.
 - 모델 목록 실패: LM Studio 서버 bind, 포트, 방화벽, API key를 확인합니다.
 - production structured scenario probe 실패: 정확한 모델 ID, 모델 로드 상태, LM Studio 0.4.8 이상, JSON Schema 지원 엔진, timeout을 확인합니다. 오류에 표시된 누락 섹션·이벤트 참조·관측 사실 불일치도 함께 확인합니다.
 - CAT 시작 실패: `LM_STUDIO_URL` scheme/host/port/path 형식과 환경 변수 값을 확인합니다.
-- 900초 timeout: GPU offload, 컨텍스트 길이, 양자화와 `CAT_LM_TIMEOUT_SECONDS`를 성능 승인 범위 안에서 조정하고 역방향 프록시 timeout도 함께 확인합니다.
+- 900초 LM timeout: GPU offload, 컨텍스트 길이, 양자화와 `CAT_LM_TIMEOUT_SECONDS`를 최대 7200초의 성능 승인 범위 안에서 조정하고 역방향 프록시 timeout도 함께 확인합니다. CAT 로그에는 모델·입력 문자 수·경과시간·endpoint만 기록되며 API key와 prompt는 기록되지 않습니다.
 - 업로드 408 timeout: 클라이언트↔CAT 전송 속도와 프록시 제한을 확인한 뒤 필요할 때만 `CAT_UPLOAD_TIMEOUT_SECONDS`를 승인 범위 안에서 늘립니다.
 - XML 제한 오류: 단일 파일·이벤트 크기, 요소 수/깊이, 파싱 시간을 확인하고 신뢰한 입력에 한해 해당 `CAT_XML_*` 값을 승인 범위 안에서 조정합니다.
-- LM Studio는 완료됐지만 웹에 보정 경고가 표시됨: 경고의 누락 섹션·참조·관측 사실 차이를 확인합니다. CAT는 canonical 사실을 복원하고 모델의 유효한 해석은 유지합니다. 이전 fail-fast 동작이 필요할 때만 `CAT_LM_STRICT_VALIDATION=true`를 사용합니다.
+- LM Studio context 초과: 기본 `CAT_LM_MAX_INPUT_CHARS=49152`는 전체 원본 대신 의미 있는 finding·evidence·의심 이벤트·시나리오를 우선 선별합니다. context 설정을 확인하고 필요하면 문자 예산을 더 낮춥니다.
+- LM Studio는 완료됐지만 웹에 안내가 표시됨: `LM 입력 범위 안내`는 전체 이벤트 중 일부 대표 증거만 모델에 전달됐다는 뜻입니다. 기본 `CAT_LM_STRICT_VALIDATION=false`에서는 JSON Schema 없이 Markdown·일반 텍스트·부분 JSON을 그대로 사용할 수 있습니다. 고정 required section이 필요한 경우에만 strict를 켭니다.

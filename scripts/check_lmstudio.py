@@ -42,7 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not isfinite(args.timeout):
             raise ValueError("timeout must be a finite number")
-        timeout = max(1.0, min(3600.0, args.timeout))
+        timeout = max(
+            1.0,
+            min(reporting.MAX_LM_TIMEOUT_SECONDS, args.timeout),
+        )
         model = args.model.strip()
         if not model:
             raise ValueError("LM Studio model ID is empty")

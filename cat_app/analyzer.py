@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import ipaddress
+import math
+from pathlib import PureWindowsPath
+import statistics
 from typing import Any, Iterable
 
 from .models import EventRecord, ParseResult
@@ -12,6 +17,78 @@ CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1, "unknown": 0}
 SCENARIO_CORRELATION_WINDOW_SECONDS = 60 * 60
 AUTHENTICATION_BURST_WINDOW_SECONDS = 10 * 60
 FINDING_EVIDENCE_LIMIT = 96
+NETWORK_CORRELATION_WINDOW_SECONDS = 10 * 60
+DNS_CORRELATION_WINDOW_SECONDS = 5 * 60
+NETWORK_ACTIVITY_GROUP_LIMIT = 64
+NETWORK_FINDING_LIMIT = 24
+NETWORK_CORRELATION_CANDIDATE_LIMIT = 32
+NETWORK_CORRELATED_DNS_LIMIT = 4
+NETWORK_FINDING_EVIDENCE_LIMIT = 32
+
+COMMON_DESTINATION_PORTS = {
+    22,
+    25,
+    53,
+    80,
+    88,
+    110,
+    123,
+    143,
+    389,
+    443,
+    445,
+    464,
+    465,
+    587,
+    636,
+    853,
+    993,
+    995,
+    3268,
+    3269,
+    3389,
+}
+HIGH_RISK_DESTINATION_PORTS = {
+    1337,
+    4444,
+    5555,
+    6666,
+    6667,
+    6668,
+    6669,
+    9001,
+    9050,
+    31337,
+}
+COMMON_NETWORK_CLIENTS = {
+    "brave.exe",
+    "chrome.exe",
+    "firefox.exe",
+    "iexplore.exe",
+    "msedge.exe",
+    "onedrive.exe",
+    "opera.exe",
+    "outlook.exe",
+    "teams.exe",
+}
+KNOWN_TUNNEL_CLIENTS = {
+    "chisel.exe",
+    "frpc.exe",
+    "ligolo-agent.exe",
+    "ngrok.exe",
+    "ncat.exe",
+    "nc.exe",
+    "plink.exe",
+    "socat.exe",
+}
+SERVER_PROCESSES_WITH_SENSITIVE_LOOPBACK = {
+    "httpd.exe",
+    "nginx.exe",
+    "php-cgi.exe",
+    "tomcat.exe",
+    "w3wp.exe",
+}
+SENSITIVE_TUNNEL_PORTS = {135, 139, 445, 3389, 5985, 5986}
 
 SUSPICIOUS_COMMAND_KEYWORDS = {
     "encoded powershell": ["encodedcommand", " -enc ", "frombase64string"],
@@ -46,6 +123,7 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
         key=lambda event: _event_time_sort_key(event.time_created),
     )
     findings: list[dict[str, Any]] = []
+    network_findings, network_activity = _network_analysis(records)
 
     findings.extend(_single_rule_findings(records))
     findings.extend(_failed_logon_bursts(records))
@@ -55,6 +133,7 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
     findings.extend(_privileged_logon_findings(records))
     findings.extend(_suspicious_process_findings(records))
     findings.extend(_powershell_findings(records))
+    findings.extend(network_findings)
 
     findings = sorted(
         findings,
@@ -80,6 +159,7 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
         },
         "parser": parse_result.to_dict(),
         "summary": _summary(records),
+        "network_activity": network_activity,
         "findings": findings,
         "suspicious_events": suspicious_events,
         "suspicious_event_scope": {
@@ -109,6 +189,20 @@ def _summary(records: list[EventRecord]) -> dict[str, Any]:
     computers = Counter(event.computer or "unknown" for event in records)
     accounts = Counter(_account(event) for event in records if _account(event))
     source_ips = Counter(_source_ip(event) for event in records if _valid_ip_field(_source_ip(event)))
+    destination_ips = Counter(
+        _destination_ip(event)
+        for event in records
+        if _valid_ip_field(_destination_ip(event))
+    )
+    destination_domains = Counter(
+        domain
+        for event in records
+        if (
+            domain := _normalized_domain(
+                _field(event, "DestinationHostname", "QueryName")
+            )
+        )
+    )
 
     timed_records = [event for event in records if event.time_created is not None]
     first_seen = timed_records[0].time_created if timed_records else None
@@ -123,6 +217,8 @@ def _summary(records: list[EventRecord]) -> dict[str, Any]:
         "top_hosts": _counter_list(computers, 20),
         "top_accounts": _counter_list(accounts, 20),
         "top_source_ips": _counter_list(source_ips, 20),
+        "top_destination_ips": _counter_list(destination_ips, 20),
+        "top_destination_domains": _counter_list(destination_domains, 20),
     }
 
 
@@ -459,6 +555,702 @@ def _powershell_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     ]
 
 
+def _network_analysis(
+    records: list[EventRecord],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Correlate process, DNS, and connection evidence without threat intel.
+
+    A public destination alone is deliberately not treated as malicious.  A
+    finding requires a stronger, locally verifiable signal such as a known
+    high-risk port, execution from a user-writable path, a suspicious command,
+    or sufficiently regular/repeated communication.  All connections are still
+    summarized in ``network_activity`` so an investigator can inspect activity
+    that did not cross the anomaly threshold.
+    """
+    process_events = [event for event in records if _is_process_creation_event(event)]
+    dns_events = [event for event in records if _is_dns_query_event(event)]
+    connection_events = [event for event in records if _is_network_connection_event(event)]
+
+    processes_by_guid: dict[
+        tuple[str, str], list[tuple[float, int, EventRecord]]
+    ] = defaultdict(list)
+    processes_by_pid: dict[
+        tuple[str, str], list[tuple[float, int, EventRecord]]
+    ] = defaultdict(list)
+    dns_by_guid: dict[
+        tuple[str, str], list[tuple[float, int, EventRecord]]
+    ] = defaultdict(list)
+    dns_by_pid: dict[
+        tuple[str, str], list[tuple[float, int, EventRecord]]
+    ] = defaultdict(list)
+    for sequence, event in enumerate(process_events):
+        host = _normalized_host(event.computer)
+        if guid := _normalized_process_guid(_field(event, "ProcessGuid")):
+            _append_timed_event(processes_by_guid, (host, guid), event, sequence)
+        if pid := _normalized_process_id(
+            _field(event, "ProcessId", "NewProcessId")
+        ):
+            _append_timed_event(processes_by_pid, (host, pid), event, sequence)
+    for sequence, event in enumerate(dns_events):
+        host = _normalized_host(event.computer)
+        if guid := _normalized_process_guid(_field(event, "ProcessGuid")):
+            _append_timed_event(dns_by_guid, (host, guid), event, sequence)
+        if pid := _normalized_process_id(_field(event, "ProcessId")):
+            _append_timed_event(dns_by_pid, (host, pid), event, sequence)
+    _sort_timed_event_index(processes_by_guid)
+    _sort_timed_event_index(processes_by_pid)
+    _sort_timed_event_index(dns_by_guid)
+    _sort_timed_event_index(dns_by_pid)
+
+    observations: list[dict[str, Any]] = []
+    for event in connection_events:
+        observation = _network_observation(event)
+        if observation is None:
+            continue
+        process_event, process_link = _correlated_process_event(
+            event,
+            processes_by_guid,
+            processes_by_pid,
+        )
+        correlated_dns, dns_link = _correlated_dns_events(
+            event,
+            dns_by_guid,
+            dns_by_pid,
+        )
+        observation["process_event"] = process_event
+        observation["dns_events"] = correlated_dns
+        observation["correlation_reasons"] = [
+            reason for reason in (process_link, dns_link) if reason
+        ]
+        observations.append(observation)
+
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    for observation in observations:
+        groups[_network_group_key(observation)].append(observation)
+
+    group_summaries: list[dict[str, Any]] = []
+    finding_candidates: list[tuple[int, dict[str, Any], list[EventRecord]]] = []
+    for grouped_observations in groups.values():
+        for session in _network_sessions(grouped_observations):
+            summary, related_events = _summarize_network_group(session)
+            group_summaries.append(summary)
+            if not summary["suspicious"]:
+                continue
+            score = int(summary.pop("_score"))
+            finding_candidates.append((score, summary, related_events))
+    for summary in group_summaries:
+        summary.pop("_score", None)
+
+    finding_candidates.sort(
+        key=lambda item: (
+            -item[0],
+            item[1].get("first_seen") or "",
+            item[1].get("destination_ip") or item[1].get("destination_hostname") or "",
+        )
+    )
+    findings: list[dict[str, Any]] = []
+    for _, summary, related_events in finding_candidates[:NETWORK_FINDING_LIMIT]:
+        rule_id = "suspicious_network_connection"
+        title_prefix = "의심 네트워크 통신"
+        if summary["beacon_signal"]:
+            rule_id = "possible_network_beacon"
+            title_prefix = "반복·주기적 외부 통신 후보"
+        elif summary["suspicious_domain_signal"]:
+            rule_id = "suspicious_dns_network_activity"
+            title_prefix = "의심 DNS와 연결된 네트워크 통신"
+        destination = (
+            summary.get("destination_hostname")
+            or summary.get("destination_ip")
+            or "목적지 미상"
+        )
+        if summary.get("destination_port"):
+            destination = f"{destination}:{summary['destination_port']}"
+        process = summary.get("process") or "프로세스 미상"
+        signals = ", ".join(summary["anomaly_signals"])
+        severity = _network_finding_severity(summary)
+        finding = _finding(
+            rule_id,
+            f"{title_prefix}: {process} -> {destination}",
+            severity,
+            related_events,
+            (
+                f"프로세스와 목적지 통신에서 {signals} 근거가 관찰되었습니다. "
+                "이는 침해 확정 판정이 아니며 승인된 관리·개발 도구 또는 정상 응용프로그램 "
+                "통신 가능성을 프로세스 서명, 자산 역할, 프록시/방화벽 로그로 확인해야 합니다."
+            ),
+            "medium",
+            [
+                "ProcessGuid와 프로세스 생성 이벤트를 기준으로 부모 프로세스, 명령줄, 파일 해시와 서명을 확인하세요.",
+                "DNS, 프록시, 방화벽 로그에서 목적지의 최초·최종 통신 시각과 전송량을 교차 검증하세요.",
+                "동일 목적지에 대한 정상 소프트웨어 기준선과 주기성을 비교하고 필요하면 호스트를 격리하세요.",
+            ],
+            evidence_limit=NETWORK_FINDING_EVIDENCE_LIMIT,
+        )
+        finding["network_context"] = {
+            key: value
+            for key, value in summary.items()
+            if key not in {"suspicious"}
+        }
+        findings.append(finding)
+
+    sorted_groups = sorted(
+        group_summaries,
+        key=lambda item: (
+            not item["suspicious"],
+            -int(item["connection_count"]),
+            item.get("first_seen") or "",
+        ),
+    )
+    external_connections = sum(
+        1 for observation in observations if observation["external_destination"]
+    )
+    unique_external_destinations = {
+        str(observation.get("destination_ip") or observation.get("destination_hostname"))
+        for observation in observations
+        if observation["external_destination"]
+        and (observation.get("destination_ip") or observation.get("destination_hostname"))
+    }
+    dns_counter = Counter(
+        query
+        for event in dns_events
+        if (query := _normalized_domain(_field(event, "QueryName")))
+    )
+    included_groups = sorted_groups[:NETWORK_ACTIVITY_GROUP_LIMIT]
+    group_limit_reached = len(sorted_groups) > len(included_groups)
+    finding_limit_reached = len(finding_candidates) > len(findings)
+    activity = {
+        "connection_event_count": len(connection_events),
+        "normalized_connection_count": len(observations),
+        "dns_query_event_count": len(dns_events),
+        "external_connection_count": external_connections,
+        "unique_external_destination_count": len(unique_external_destinations),
+        "group_count": len(sorted_groups),
+        "included_group_count": len(included_groups),
+        "suspicious_group_count": len(finding_candidates),
+        "included_finding_count": len(findings),
+        "truncated": group_limit_reached or finding_limit_reached,
+        "limitation": (
+            f"네트워크 통신 {len(sorted_groups)}개 그룹 중 대표 {len(included_groups)}개와 "
+            f"의심 그룹 {len(finding_candidates)}개 중 최대 {NETWORK_FINDING_LIMIT}개 finding만 포함했습니다."
+            if group_limit_reached or finding_limit_reached
+            else "공개 위협 인텔리전스 없이 로컬 이벤트의 목적지·포트·경로·반복성만 평가했습니다. 정상 기준선과 교차 검증해야 합니다."
+        ),
+        "top_dns_queries": _counter_list(dns_counter, 30),
+        "connections": included_groups,
+    }
+    return findings, activity
+
+
+def _network_observation(event: EventRecord) -> dict[str, Any] | None:
+    destination_ip = _destination_ip(event)
+    destination_hostname = _field(event, "DestinationHostname")
+    destination_port = _normalized_port(_destination_port(event))
+    source_ip = _source_ip(event)
+    source_port = _normalized_port(_source_port(event))
+    process = _process(event)
+    process_guid = _normalized_process_guid(_field(event, "ProcessGuid"))
+    process_id = _normalized_process_id(_field(event, "ProcessId", "ProcessID"))
+    protocol = _normalized_protocol(_field(event, "Protocol"))
+    initiated = _normalized_boolean(_field(event, "Initiated"))
+    direction = _network_direction(event, initiated)
+    if not any((destination_ip, destination_hostname, destination_port, process)):
+        return None
+    return {
+        "event": event,
+        "time": event.time_created,
+        "host": event.computer,
+        "source_ip": source_ip,
+        "source_port": source_port,
+        "destination_ip": destination_ip,
+        "destination_port": destination_port,
+        "destination_hostname": destination_hostname,
+        "protocol": protocol,
+        "initiated": initiated,
+        "network_direction": direction,
+        "process": process,
+        "process_guid": process_guid,
+        "process_id": process_id,
+        "external_destination": _is_external_destination(
+            destination_ip,
+            destination_hostname,
+        ),
+    }
+
+
+def _network_group_key(observation: dict[str, Any]) -> tuple[str, ...]:
+    process_identity = (
+        observation.get("process_guid")
+        or "|".join(
+            (
+                str(observation.get("process") or "").casefold(),
+                str(observation.get("process_id") or ""),
+            )
+        )
+    )
+    return (
+        _normalized_host(observation.get("host")),
+        str(process_identity),
+        str(observation.get("destination_ip") or "").casefold(),
+        str(observation.get("destination_hostname") or "").casefold(),
+        str(observation.get("destination_port") or ""),
+        str(observation.get("protocol") or "").casefold(),
+        str(observation.get("network_direction") or "").casefold(),
+    )
+
+
+def _network_sessions(
+    observations: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Split PID-only groups at long gaps to avoid PID-reuse correlations."""
+    ordered = sorted(
+        observations,
+        key=lambda item: _event_time_sort_key(item.get("time")),
+    )
+    if not ordered or any(item.get("process_guid") for item in ordered):
+        return [ordered] if ordered else []
+    sessions: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    previous_time: datetime | None = None
+    for observation in ordered:
+        current_time = observation.get("time")
+        if (
+            current
+            and previous_time is not None
+            and current_time is not None
+            and (_as_utc(current_time) - _as_utc(previous_time)).total_seconds()
+            > SCENARIO_CORRELATION_WINDOW_SECONDS
+        ):
+            sessions.append(current)
+            current = []
+        current.append(observation)
+        if current_time is not None:
+            previous_time = current_time
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def _summarize_network_group(
+    observations: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[EventRecord]]:
+    observations = sorted(
+        observations,
+        key=lambda item: _event_time_sort_key(item["time"]),
+    )
+    first = observations[0]
+    timed = [item["time"] for item in observations if item["time"] is not None]
+    dns_events = _deduplicate_events(
+        event
+        for item in observations
+        for event in item.get("dns_events") or []
+    )
+    process_events = _deduplicate_events(
+        item["process_event"]
+        for item in observations
+        if item.get("process_event") is not None
+    )
+    connection_events = _deduplicate_events(item["event"] for item in observations)
+    related_events = _deduplicate_events(
+        [*process_events, *dns_events, *connection_events]
+    )
+    process = first.get("process")
+    if not process and process_events:
+        process = _process(process_events[0])
+    command_suspicious = any(
+        _event_has_suspicious_command(event) for event in process_events
+    )
+    writable_path = _is_user_writable_process_path(process)
+    process_name = _windows_basename(process)
+    destination_port = first.get("destination_port")
+    high_risk_port = destination_port in HIGH_RISK_DESTINATION_PORTS
+    nonstandard_port = bool(
+        destination_port and destination_port not in COMMON_DESTINATION_PORTS
+    )
+    common_client = process_name in COMMON_NETWORK_CLIENTS
+    known_tunnel_client = process_name in KNOWN_TUNNEL_CLIENTS
+    sensitive_loopback = bool(
+        _is_loopback_ip(first.get("destination_ip"))
+        and destination_port in SENSITIVE_TUNNEL_PORTS
+        and process_name in SERVER_PROCESSES_WITH_SENSITIVE_LOOPBACK
+        and first.get("network_direction") != "inbound"
+    )
+    possible_beacon, beacon_detail = _possible_beacon(timed)
+    dns_queries = sorted(
+        {
+            query
+            for event in dns_events
+            if (query := _normalized_domain(_field(event, "QueryName")))
+        }
+    )
+    suspicious_domain_pattern = any(
+        _suspicious_domain_pattern(query) for query in dns_queries
+    )
+    external_destination = any(
+        item["external_destination"] for item in observations
+    )
+
+    signals: list[str] = []
+    score = 0
+    if external_destination:
+        signals.append("외부/비로컬 목적지")
+        score += 1
+    if high_risk_port:
+        signals.append(f"고위험 목적지 포트 {destination_port}")
+        score += 5
+    if nonstandard_port:
+        signals.append(f"비표준 목적지 포트 {destination_port}")
+        score += 1
+    if writable_path and not (common_client and not high_risk_port):
+        signals.append("사용자 쓰기 가능 경로의 프로세스")
+        score += 3
+    if command_suspicious:
+        signals.append("연결된 프로세스 생성 이벤트의 의심 명령줄")
+        score += 4
+    if known_tunnel_client:
+        signals.append(f"알려진 터널링 도구 프로세스 {process_name}")
+        score += 5
+    if sensitive_loopback:
+        signals.append(
+            f"서버 프로세스의 민감 서비스 loopback 통신 {destination_port}"
+        )
+        score += 5
+    if dns_queries:
+        signals.append("ProcessGuid/PID와 시간으로 연결된 DNS 질의")
+        score += 1
+    if suspicious_domain_pattern:
+        signals.append("긴 고엔트로피 DNS 레이블")
+        score += 3
+    if possible_beacon:
+        signals.append(beacon_detail)
+        score += 5
+
+    strong_process_signal = command_suspicious or (
+        writable_path and not (common_client and not high_risk_port)
+    )
+    suspicious_domain_signal = bool(
+        suspicious_domain_pattern
+        and external_destination
+        and (strong_process_signal or nonstandard_port or len(observations) >= 3)
+    )
+    beacon_signal = bool(
+        possible_beacon
+        and external_destination
+        and first.get("network_direction") != "inbound"
+    )
+    suspicious = bool(
+        high_risk_port
+        or known_tunnel_client
+        or sensitive_loopback
+        or beacon_signal
+        or suspicious_domain_signal
+        or (external_destination and strong_process_signal)
+        or (external_destination and nonstandard_port and strong_process_signal)
+    )
+    correlation_reasons = []
+    for observation in observations:
+        for reason in observation.get("correlation_reasons") or []:
+            if reason not in correlation_reasons:
+                correlation_reasons.append(reason)
+    summary = {
+        "first_seen": isoformat_utc(timed[0]) if timed else None,
+        "last_seen": isoformat_utc(timed[-1]) if timed else None,
+        "host": first.get("host"),
+        "source_ip": first.get("source_ip"),
+        "source_port": first.get("source_port"),
+        "destination_ip": first.get("destination_ip"),
+        "destination_port": destination_port,
+        "destination_hostname": first.get("destination_hostname"),
+        "protocol": first.get("protocol"),
+        "initiated": first.get("initiated"),
+        "network_direction": first.get("network_direction"),
+        "process": process,
+        "process_guid": first.get("process_guid"),
+        "process_id": first.get("process_id"),
+        "connection_count": len(observations),
+        "external_destination": external_destination,
+        "dns_queries": dns_queries[:12],
+        "correlation_reasons": correlation_reasons,
+        "anomaly_signals": signals,
+        "possible_beacon": possible_beacon,
+        "beacon_signal": beacon_signal,
+        "suspicious_domain_pattern": suspicious_domain_pattern,
+        "suspicious_domain_signal": suspicious_domain_signal,
+        "known_tunnel_client": known_tunnel_client,
+        "sensitive_loopback": sensitive_loopback,
+        "suspicious": suspicious,
+        "_score": score,
+    }
+    return summary, related_events
+
+
+def _correlated_process_event(
+    event: EventRecord,
+    by_guid: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+    by_pid: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+) -> tuple[EventRecord | None, str | None]:
+    host = _normalized_host(event.computer)
+    guid = _normalized_process_guid(_field(event, "ProcessGuid"))
+    if guid:
+        candidates = by_guid.get((host, guid), [])
+        if candidate := _most_recent_preceding_event(event, candidates, None):
+            return candidate, "동일 ProcessGuid로 프로세스 생성 이벤트 연결"
+
+    pid = _normalized_process_id(_field(event, "ProcessId", "ProcessID"))
+    if not pid:
+        return None, None
+    candidates = by_pid.get((host, pid), [])
+    candidate = _most_recent_preceding_event(
+        event,
+        candidates,
+        NETWORK_CORRELATION_WINDOW_SECONDS,
+    )
+    if candidate is None:
+        return None, None
+    connection_image = str(_process(event) or "").casefold()
+    process_image = str(_process(candidate) or "").casefold()
+    image_relation = "프로세스 경로"
+    if connection_image and process_image and connection_image != process_image:
+        connection_name = _windows_basename(connection_image)
+        process_name = _windows_basename(process_image)
+        if not connection_name or connection_name != process_name:
+            return None, None
+        # Security 5156 commonly records an NT device path while 4688 records
+        # a drive-letter path.  Host + PID + a short time window + the same
+        # executable basename is useful supporting evidence, but the wording
+        # keeps this weaker than an exact path or ProcessGuid match.
+        image_relation = "프로세스 파일명(경로 표기 상이)"
+    return (
+        candidate,
+        f"동일 호스트·PID·{image_relation}와 10분 시간창으로 프로세스 생성 이벤트 연결",
+    )
+
+
+def _correlated_dns_events(
+    event: EventRecord,
+    by_guid: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+    by_pid: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+) -> tuple[list[EventRecord], str | None]:
+    host = _normalized_host(event.computer)
+    guid = _normalized_process_guid(_field(event, "ProcessGuid"))
+    pid = _normalized_process_id(_field(event, "ProcessId", "ProcessID"))
+    candidates: list[EventRecord] = []
+    link_kind: str | None = None
+    if guid:
+        candidates = _events_near_target(
+            event,
+            by_guid.get((host, guid), []),
+            DNS_CORRELATION_WINDOW_SECONDS,
+        )
+        if candidates:
+            link_kind = "동일 ProcessGuid"
+    if not candidates and pid:
+        candidates = _events_near_target(
+            event,
+            by_pid.get((host, pid), []),
+            DNS_CORRELATION_WINDOW_SECONDS,
+        )
+        if candidates:
+            link_kind = "동일 호스트·PID"
+    if not candidates:
+        return [], None
+
+    destination_hostname = _normalized_domain(_field(event, "DestinationHostname"))
+    linked: list[tuple[float, EventRecord]] = []
+    for candidate in candidates:
+        delta = _event_time_delta_seconds(event, candidate)
+        if delta is None or delta > DNS_CORRELATION_WINDOW_SECONDS:
+            continue
+        query = _normalized_domain(_field(candidate, "QueryName"))
+        if destination_hostname and query and not _domains_equivalent(
+            destination_hostname,
+            query,
+        ):
+            continue
+        linked.append((delta, candidate))
+    if not linked:
+        return [], None
+    linked.sort(key=lambda item: item[0])
+    domain_note = " 및 동일 도메인" if destination_hostname else ""
+    return (
+        [item[1] for item in linked[:NETWORK_CORRELATED_DNS_LIMIT]],
+        f"{link_kind}{domain_note}, 5분 시간창으로 DNS 질의 연결",
+    )
+
+
+def _most_recent_preceding_event(
+    target: EventRecord,
+    candidates: list[tuple[float, int, EventRecord]],
+    max_delta_seconds: int | None,
+) -> EventRecord | None:
+    if target.time_created is None or not candidates:
+        return None
+    target_timestamp = _as_utc(target.time_created).timestamp()
+    position = bisect_right(candidates, (target_timestamp, 10**30)) - 1
+    if position < 0:
+        return None
+    candidate_timestamp, _, candidate = candidates[position]
+    if (
+        max_delta_seconds is not None
+        and target_timestamp - candidate_timestamp > max_delta_seconds
+    ):
+        return None
+    return candidate
+
+
+def _events_near_target(
+    target: EventRecord,
+    candidates: list[tuple[float, int, EventRecord]],
+    max_delta_seconds: int,
+) -> list[EventRecord]:
+    if target.time_created is None or not candidates:
+        return []
+    target_timestamp = _as_utc(target.time_created).timestamp()
+    left = bisect_left(candidates, (target_timestamp - max_delta_seconds, -1))
+    right = bisect_right(candidates, (target_timestamp + max_delta_seconds, 10**30))
+    position = bisect_left(candidates, (target_timestamp, -1), left, right)
+    half_limit = NETWORK_CORRELATION_CANDIDATE_LIMIT // 2
+    nearby_left = max(left, position - half_limit)
+    nearby_right = min(
+        right,
+        nearby_left + NETWORK_CORRELATION_CANDIDATE_LIMIT,
+    )
+    nearby_left = max(left, nearby_right - NETWORK_CORRELATION_CANDIDATE_LIMIT)
+    nearby = candidates[nearby_left:nearby_right]
+    return [item[2] for item in nearby]
+
+
+def _append_timed_event(
+    index: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+    key: tuple[str, str],
+    event: EventRecord,
+    sequence: int,
+) -> None:
+    if event.time_created is None:
+        return
+    index[key].append((_as_utc(event.time_created).timestamp(), sequence, event))
+
+
+def _sort_timed_event_index(
+    index: dict[tuple[str, str], list[tuple[float, int, EventRecord]]],
+) -> None:
+    for events in index.values():
+        events.sort(key=lambda item: (item[0], item[1]))
+
+
+def _possible_beacon(times: list[datetime]) -> tuple[bool, str]:
+    if len(times) < 6:
+        return False, ""
+    normalized = sorted(_as_utc(value) for value in times)
+    intervals = [
+        (right - left).total_seconds()
+        for left, right in zip(normalized, normalized[1:])
+        if (right - left).total_seconds() > 0
+    ]
+    if len(intervals) < 5:
+        return False, ""
+    median_interval = statistics.median(intervals)
+    if not 5 <= median_interval <= 60 * 60:
+        return False, ""
+    tolerance = max(2.0, median_interval * 0.20)
+    regular_count = sum(
+        abs(interval - median_interval) <= tolerance for interval in intervals
+    )
+    regular_ratio = regular_count / len(intervals)
+    if regular_ratio < 0.75:
+        return False, ""
+    return (
+        True,
+        f"반복·주기 통신 후보 {len(times)}회(중앙 간격 {median_interval:.1f}초, 규칙성 {regular_ratio:.0%})",
+    )
+
+
+def _network_finding_severity(summary: dict[str, Any]) -> str:
+    signals = set(summary.get("anomaly_signals") or [])
+    strong_count = sum(
+        1
+        for prefix in (
+            "고위험 목적지 포트",
+            "사용자 쓰기 가능 경로",
+            "연결된 프로세스 생성 이벤트",
+            "알려진 터널링 도구",
+            "서버 프로세스의 민감 서비스 loopback",
+            "반복·주기 통신 후보",
+            "긴 고엔트로피",
+        )
+        if any(str(signal).startswith(prefix) for signal in signals)
+    )
+    return "high" if strong_count >= 2 else "medium"
+
+
+def _event_has_suspicious_command(event: EventRecord) -> bool:
+    text = f" {_event_text(event).casefold()} "
+    return any(
+        keyword in text
+        for keywords in SUSPICIOUS_COMMAND_KEYWORDS.values()
+        for keyword in keywords
+    ) or any(keyword in text for keyword in POWERSHELL_KEYWORDS)
+
+
+def _is_user_writable_process_path(value: Any) -> bool:
+    if not value:
+        return False
+    path = str(value).strip().replace("/", "\\").casefold()
+    return any(
+        marker in path
+        for marker in (
+            "\\appdata\\",
+            "\\downloads\\",
+            "\\desktop\\",
+            "\\users\\public\\",
+            "\\windows\\temp\\",
+            "\\programdata\\",
+            "\\$recycle.bin\\",
+        )
+    ) or path.startswith(("temp\\", "tmp\\"))
+
+
+def _windows_basename(value: Any) -> str:
+    if not value:
+        return ""
+    return PureWindowsPath(str(value)).name.casefold()
+
+
+def _suspicious_domain_pattern(value: str) -> bool:
+    # Conservative DGA-like heuristic: require a long, mixed alphanumeric,
+    # high-entropy first label.  It is only promoted as a hypothesis.
+    label = value.split(".", 1)[0].casefold()
+    if len(label) < 28 or not label.isalnum():
+        return False
+    digit_count = sum(character.isdigit() for character in label)
+    letter_count = sum(character.isalpha() for character in label)
+    if digit_count < 4 or letter_count < 12:
+        return False
+    counts = Counter(label)
+    entropy = -sum(
+        (count / len(label)) * math.log2(count / len(label))
+        for count in counts.values()
+    )
+    return entropy >= 3.8
+
+
+def _deduplicate_events(events: Iterable[EventRecord]) -> list[EventRecord]:
+    seen: set[tuple[str, ...]] = set()
+    result = []
+    for event in events:
+        key = (
+            event.source_file,
+            str(event.record_id or ""),
+            str(event.event_id or ""),
+            isoformat_utc(event.time_created) or "",
+            event.computer or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(event)
+    return result
+
+
 def _timeline(records: list[EventRecord], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     finding_event_keys = set()
@@ -481,6 +1273,17 @@ def _timeline(records: list[EventRecord], findings: list[dict[str, Any]]) -> lis
                     "host": evidence.get("host"),
                     "account": evidence.get("account"),
                     "source_ip": evidence.get("source_ip"),
+                    "source_port": evidence.get("source_port"),
+                    "destination_ip": evidence.get("destination_ip"),
+                    "destination_port": evidence.get("destination_port"),
+                    "destination_hostname": evidence.get("destination_hostname"),
+                    "protocol": evidence.get("protocol"),
+                    "initiated": evidence.get("initiated"),
+                    "process": evidence.get("process"),
+                    "process_id": evidence.get("process_id"),
+                    "process_guid": evidence.get("process_guid"),
+                    "query_name": evidence.get("query_name"),
+                    "network_direction": evidence.get("network_direction"),
                 }
             )
 
@@ -500,6 +1303,17 @@ def _timeline(records: list[EventRecord], findings: list[dict[str, Any]]) -> lis
                     "host": event.computer,
                     "account": evidence.get("account"),
                     "source_ip": evidence.get("source_ip"),
+                    "source_port": evidence.get("source_port"),
+                    "destination_ip": evidence.get("destination_ip"),
+                    "destination_port": evidence.get("destination_port"),
+                    "destination_hostname": evidence.get("destination_hostname"),
+                    "protocol": evidence.get("protocol"),
+                    "initiated": evidence.get("initiated"),
+                    "process": evidence.get("process"),
+                    "process_id": evidence.get("process_id"),
+                    "process_guid": evidence.get("process_guid"),
+                    "query_name": evidence.get("query_name"),
+                    "network_direction": evidence.get("network_direction"),
                 }
             )
             if len(entries) >= 50:
@@ -532,7 +1346,17 @@ def _suspicious_events(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "host": evidence.get("host"),
                     "account": evidence.get("account"),
                     "source_ip": evidence.get("source_ip"),
+                    "source_port": evidence.get("source_port"),
+                    "destination_ip": evidence.get("destination_ip"),
+                    "destination_port": evidence.get("destination_port"),
+                    "destination_hostname": evidence.get("destination_hostname"),
+                    "protocol": evidence.get("protocol"),
+                    "initiated": evidence.get("initiated"),
                     "process": evidence.get("process"),
+                    "process_id": evidence.get("process_id"),
+                    "process_guid": evidence.get("process_guid"),
+                    "query_name": evidence.get("query_name"),
+                    "network_direction": evidence.get("network_direction"),
                     "command_line": evidence.get("command_line"),
                     "fields": dict(evidence.get("fields") or {}),
                     "severity": severity,
@@ -578,7 +1402,18 @@ def _evidence_identity(evidence: dict[str, Any]) -> tuple[str, ...]:
             "channel",
             "host",
             "account",
+            "source_ip",
+            "source_port",
+            "destination_ip",
+            "destination_port",
+            "destination_hostname",
+            "protocol",
+            "initiated",
             "process",
+            "process_id",
+            "process_guid",
+            "query_name",
+            "network_direction",
             "command_line",
         )
     )
@@ -756,6 +1591,33 @@ def _event_link_reasons(left: dict[str, Any], right: dict[str, Any]) -> list[str
         shared_processes = left_processes & right_processes
         if shared_processes:
             shared_entity_reasons.append("동일 또는 부모/자식 프로세스 경로 공유")
+        left_process_guid = _normalized_process_guid(
+            left.get("process_guid") or left_fields.get("ProcessGuid")
+        )
+        right_process_guid = _normalized_process_guid(
+            right.get("process_guid") or right_fields.get("ProcessGuid")
+        )
+        if left_process_guid and left_process_guid == right_process_guid:
+            shared_entity_reasons.append("동일 ProcessGuid 공유")
+
+        left_destination = (
+            left.get("destination_ip")
+            or left.get("destination_hostname")
+            or left.get("query_name")
+        )
+        right_destination = (
+            right.get("destination_ip")
+            or right.get("destination_hostname")
+            or right.get("query_name")
+        )
+        if (
+            left_destination
+            and right_destination
+            and str(left_destination).casefold() == str(right_destination).casefold()
+        ):
+            shared_entity_reasons.append(
+                f"동일 네트워크 목적지 {left_destination} 공유"
+            )
 
     transition_reason = _rule_transition_reason(
         left.get("rule_ids") or [],
@@ -838,6 +1700,9 @@ def _rule_transition_reason(left_rules: list[str], right_rules: list[str]) -> st
     execution_rules = {
         "suspicious_powershell",
         "wmi_activity",
+        "suspicious_network_connection",
+        "possible_network_beacon",
+        "suspicious_dns_network_activity",
     }
     defense_rules = {"log_cleared", "defender_detection_or_tamper"}
     persistence_rules = {
@@ -953,6 +1818,9 @@ def _scenario_phase(rule_ids: list[str]) -> str:
         "privileged_logon": "고권한 세션 활동",
         "wmi_activity": "실행·측면 이동·지속성 후보",
         "suspicious_powershell": "실행",
+        "suspicious_network_connection": "명령제어 또는 비정상 통신 후보",
+        "possible_network_beacon": "명령제어 반복 통신 후보",
+        "suspicious_dns_network_activity": "의심 DNS/네트워크 통신 후보",
     }
     for rule_id in rule_ids:
         if rule_id in phase_by_rule:
@@ -977,6 +1845,13 @@ def _scenario_stage_description(event: dict[str, Any]) -> str:
         details.append(f"account={event['account']}")
     if event.get("source_ip"):
         details.append(f"src={event['source_ip']}")
+    destination = event.get("destination_ip") or event.get("destination_hostname")
+    if destination:
+        if event.get("destination_port"):
+            destination = f"{destination}:{event['destination_port']}"
+        details.append(f"dst={destination}")
+    if event.get("query_name"):
+        details.append(f"dns={event['query_name']}")
     return f"{title}: {', '.join(details)}"
 
 
@@ -1063,6 +1938,7 @@ def _finding(
     description: str,
     confidence: str,
     steps: list[str],
+    evidence_limit: int = FINDING_EVIDENCE_LIMIT,
 ) -> dict[str, Any]:
     ordered = sorted(
         events,
@@ -1082,11 +1958,15 @@ def _finding(
         "severity": severity,
         "confidence": confidence,
         "event_count": len(events),
+        "evidence_limit": evidence_limit,
         "first_seen": isoformat_utc(first_seen),
         "last_seen": isoformat_utc(last_seen),
         "description": description,
         "entities": _entities(ordered),
-        "evidence": [_evidence(event) for event in _representative_events(ordered)],
+        "evidence": [
+            _evidence(event)
+            for event in _representative_events(ordered, evidence_limit)
+        ],
         "analysis_guidance": _analysis_guidance(rule_id),
         "recommended_next_steps": steps,
     }
@@ -1163,6 +2043,9 @@ def _entities(events: Iterable[EventRecord]) -> dict[str, list[str]]:
     accounts = Counter()
     hosts = Counter()
     source_ips = Counter()
+    destination_ips = Counter()
+    destination_domains = Counter()
+    destination_ports = Counter()
     processes = Counter()
     services = Counter()
     tasks = Counter()
@@ -1173,6 +2056,14 @@ def _entities(events: Iterable[EventRecord]) -> dict[str, list[str]]:
             hosts[event.computer] += 1
         if _valid_ip_field(_source_ip(event)):
             source_ips[_source_ip(event)] += 1
+        if _valid_ip_field(_destination_ip(event)):
+            destination_ips[_destination_ip(event)] += 1
+        if destination_domain := _normalized_domain(
+            _field(event, "DestinationHostname", "QueryName")
+        ):
+            destination_domains[destination_domain] += 1
+        if destination_port := _normalized_port(_destination_port(event)):
+            destination_ports[str(destination_port)] += 1
         if process := _process(event):
             processes[process] += 1
         if service := _field(event, "ServiceName"):
@@ -1183,6 +2074,9 @@ def _entities(events: Iterable[EventRecord]) -> dict[str, list[str]]:
         "accounts": [item for item, _ in accounts.most_common(10)],
         "hosts": [item for item, _ in hosts.most_common(10)],
         "source_ips": [item for item, _ in source_ips.most_common(10)],
+        "destination_ips": [item for item, _ in destination_ips.most_common(10)],
+        "destination_domains": [item for item, _ in destination_domains.most_common(10)],
+        "destination_ports": [item for item, _ in destination_ports.most_common(10)],
         "processes": [item for item, _ in processes.most_common(10)],
         "services": [item for item, _ in services.most_common(10)],
         "tasks": [item for item, _ in tasks.most_common(10)],
@@ -1201,16 +2095,44 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
             "SubjectDomainName",
             "IpAddress",
             "IpPort",
+            "SourceIp",
+            "SourceHostname",
+            "SourcePort",
+            "SourcePortName",
+            "DestinationIp",
+            "DestinationHostname",
+            "DestinationPort",
+            "DestinationPortName",
+            "SourceAddress",
+            "DestAddress",
+            "DestPort",
+            "Protocol",
+            "Initiated",
+            "Direction",
+            "QueryName",
+            "QueryStatus",
+            "QueryResults",
+            "ProcessGuid",
+            "User",
             "WorkstationName",
             "LogonType",
             "Status",
             "SubStatus",
             "ProcessName",
             "ProcessId",
+            "ProcessID",
             "ClientProcessId",
+            "Image",
+            "OriginalFileName",
+            "Hashes",
+            "IntegrityLevel",
             "NewProcessName",
             "NewProcessId",
+            "Application",
             "CommandLine",
+            "ParentImage",
+            "ParentProcessGuid",
+            "ParentCommandLine",
             "ParentProcessName",
             "ParentProcessId",
             "ServiceName",
@@ -1257,7 +2179,22 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
         "record_id": event.record_id,
         "account": _account(event),
         "source_ip": _source_ip(event),
+        "source_port": _normalized_port(_source_port(event)),
+        "destination_ip": _destination_ip(event),
+        "destination_port": _normalized_port(_destination_port(event)),
+        "destination_hostname": _field(event, "DestinationHostname"),
+        "protocol": _normalized_protocol(_field(event, "Protocol")),
+        "initiated": _normalized_boolean(_field(event, "Initiated")),
         "process": _process(event),
+        "process_id": _normalized_process_id(
+            _field(event, "ProcessId", "ProcessID", "NewProcessId")
+        ),
+        "process_guid": _normalized_process_guid(_field(event, "ProcessGuid")),
+        "query_name": _field(event, "QueryName"),
+        "network_direction": _network_direction(
+            event,
+            _normalized_boolean(_field(event, "Initiated")),
+        ),
         "command_line": _truncate(_command_line(event), 600),
         "fields": {key: _truncate(value, 600) for key, value in selected_fields.items()},
     }
@@ -1311,6 +2248,23 @@ def _is_process_creation_event(event: EventRecord) -> bool:
         return False
     return (
         _provider(event) == "microsoft-windows-sysmon"
+        and _channel(event) == "microsoft-windows-sysmon/operational"
+    )
+
+
+def _is_network_connection_event(event: EventRecord) -> bool:
+    if _event_id(event) == "3":
+        return (
+            _provider(event) == "microsoft-windows-sysmon"
+            and _channel(event) == "microsoft-windows-sysmon/operational"
+        )
+    return _event_id(event) == "5156" and _is_security_event(event)
+
+
+def _is_dns_query_event(event: EventRecord) -> bool:
+    return (
+        _event_id(event) == "22"
+        and _provider(event) == "microsoft-windows-sysmon"
         and _channel(event) == "microsoft-windows-sysmon/operational"
     )
 
@@ -1369,6 +2323,17 @@ def _is_wmi_activity_event(event: EventRecord) -> bool:
 
 
 def _analysis_guidance(rule_id: str) -> dict[str, Any]:
+    if rule_id in {
+        "suspicious_network_connection",
+        "possible_network_beacon",
+        "suspicious_dns_network_activity",
+    }:
+        return {
+            "cause_focus": "ProcessGuid를 우선으로 Sysmon 1/3/22를 연결하고 Image, CommandLine, DestinationIp/Port/Hostname, QueryName을 원인 후보로 추적합니다.",
+            "observed_behavior": "외부·비로컬 목적지, 고위험 포트, 사용자 쓰기 가능 경로, 터널링 도구, DNS 연결 또는 반복 주기성 중 하나 이상의 구체적 통신 신호가 관찰되었습니다.",
+            "not_proven": "목적지 평판, 전송 내용과 바이트 수가 없으므로 C2, 데이터 유출 또는 악성 여부는 확정되지 않습니다. 승인된 원격 관리·개발·업데이트 통신일 수 있습니다.",
+            "correlation_targets": ["Sysmon 1/3/22 ProcessGuid", "Security 5156", "프록시/방화벽/DNS", "파일 해시·서명 및 프로세스 계보"],
+        }
     if rule_id == "log_cleared":
         return {
             "cause_focus": "Security 1102, Microsoft-Windows-Eventlog/System 104, 또는 로그 삭제 명령 실행 주체를 원인 후보로 추적합니다.",
@@ -1457,7 +2422,26 @@ def _account(event: EventRecord) -> str | None:
 
 
 def _source_ip(event: EventRecord) -> str | None:
-    return _field(event, "IpAddress", "SourceNetworkAddress", "ClientAddress", "SourceAddress")
+    return _field(
+        event,
+        "IpAddress",
+        "SourceIp",
+        "SourceNetworkAddress",
+        "ClientAddress",
+        "SourceAddress",
+    )
+
+
+def _source_port(event: EventRecord) -> str | None:
+    return _field(event, "IpPort", "SourcePort")
+
+
+def _destination_ip(event: EventRecord) -> str | None:
+    return _field(event, "DestinationIp", "DestAddress")
+
+
+def _destination_port(event: EventRecord) -> str | None:
+    return _field(event, "DestinationPort", "DestPort")
 
 
 def _process(event: EventRecord) -> str | None:
@@ -1466,6 +2450,144 @@ def _process(event: EventRecord) -> str | None:
 
 def _command_line(event: EventRecord) -> str | None:
     return _field(event, "CommandLine", "ProcessCommandLine", "ScriptBlockText")
+
+
+def _normalized_host(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _normalized_process_guid(value: Any) -> str | None:
+    text = str(value or "").strip().casefold()
+    if not text or text == "-":
+        return None
+    compact = text.strip("{}").replace("-", "")
+    if compact and set(compact) == {"0"}:
+        return None
+    return text
+
+
+def _normalized_process_id(value: Any) -> str | None:
+    text = str(value or "").strip().casefold()
+    if not text or text == "-":
+        return None
+    try:
+        number = int(text, 0)
+    except ValueError:
+        try:
+            number = int(text, 10)
+        except ValueError:
+            return text
+    if number < 0:
+        return None
+    return str(number)
+
+
+def _normalized_port(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return None
+    try:
+        port = int(text, 10)
+    except ValueError:
+        return None
+    return port if 0 <= port <= 65535 else None
+
+
+def _normalized_boolean(value: Any) -> bool | None:
+    text = str(value or "").strip().casefold()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _normalized_protocol(value: Any) -> str | None:
+    text = str(value or "").strip().casefold()
+    return {
+        "1": "icmp",
+        "6": "tcp",
+        "17": "udp",
+        "58": "icmpv6",
+    }.get(text, text or None)
+
+
+def _network_direction(event: EventRecord, initiated: bool | None) -> str | None:
+    if initiated is not None:
+        return "outbound" if initiated else "inbound"
+    value = str(_field(event, "Direction") or "").strip().casefold()
+    if value in {"%%14593", "outbound", "out", "egress"}:
+        return "outbound"
+    if value in {"%%14592", "inbound", "in", "ingress"}:
+        return "inbound"
+    return value or None
+
+
+def _normalized_domain(value: Any) -> str:
+    return str(value or "").strip().rstrip(".").casefold()
+
+
+def _domains_equivalent(left: str, right: str) -> bool:
+    return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
+
+
+def _is_external_destination(
+    destination_ip: Any,
+    destination_hostname: Any,
+) -> bool:
+    if destination_ip:
+        try:
+            address = ipaddress.ip_address(str(destination_ip).strip())
+        except ValueError:
+            pass
+        else:
+            if address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified:
+                return False
+            if isinstance(address, ipaddress.IPv4Address):
+                internal_v4 = (
+                    ipaddress.ip_network("10.0.0.0/8"),
+                    ipaddress.ip_network("100.64.0.0/10"),
+                    ipaddress.ip_network("172.16.0.0/12"),
+                    ipaddress.ip_network("192.168.0.0/16"),
+                )
+                return not any(address in network for network in internal_v4)
+            return not address.is_private
+    hostname = _normalized_domain(destination_hostname)
+    if not hostname or hostname in {"localhost", "-"}:
+        return False
+    return not hostname.endswith((".local", ".lan", ".internal"))
+
+
+def _is_loopback_ip(value: Any) -> bool:
+    if not value:
+        return False
+    try:
+        return ipaddress.ip_address(str(value).strip()).is_loopback
+    except ValueError:
+        return False
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _signed_event_time_delta_seconds(
+    target: EventRecord,
+    candidate: EventRecord,
+) -> float | None:
+    if target.time_created is None or candidate.time_created is None:
+        return None
+    return (_as_utc(target.time_created) - _as_utc(candidate.time_created)).total_seconds()
+
+
+def _event_time_delta_seconds(
+    left: EventRecord,
+    right: EventRecord,
+) -> float | None:
+    delta = _signed_event_time_delta_seconds(left, right)
+    return abs(delta) if delta is not None else None
 
 
 def _event_text(event: EventRecord) -> str:

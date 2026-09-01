@@ -244,15 +244,39 @@ function renderReport(markdown, llm, analysis = {}) {
     const warnings = Array.isArray(llm?.validation_warnings)
       ? llm.validation_warnings.filter((item) => typeof item === "string" && item.trim())
       : [];
+    const warningTitle = llm?.structured_report_recovered
+      ? "응답 보정 안내"
+      : "LM 응답 안내";
+    const inputScopeNotice = renderLmInputScopeNotice(llm);
     status = llm?.used
-      ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})${llm.validation_mode === "relaxed" ? " / 완화 검증" : ""}</p>${
+      ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})${llm.validation_mode === "relaxed" ? " / 자유 형식" : " / strict 검증"}</p>${inputScopeNotice}${
           warnings.length
-            ? `<div class="llm-warning"><strong>응답 보정 안내:</strong><ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
+            ? `<div class="llm-warning"><strong>${warningTitle}:</strong><ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
             : ""
         }`
       : `<p><strong>에이전트:</strong> LM Studio Qwen 미사용${llm?.error ? ` - ${escapeHtml(llm.error)}` : ""}</p>`;
   }
   reportView.innerHTML = `${renderParserWarning(analysis)}${status}${markdownToHtml(String(markdown || ""))}`;
+}
+
+function renderLmInputScopeNotice(llm) {
+  if (llm?.input_truncated !== true) return "";
+  const countPairs = [
+    ["finding", llm.input_findings, llm.source_findings ?? llm.input_source_findings],
+    ["의심 이벤트", llm.input_suspicious_events, llm.source_suspicious_events ?? llm.input_source_suspicious_events],
+    ["시나리오", llm.input_scenario_candidates, llm.source_scenario_candidates ?? llm.input_source_scenario_candidates],
+    ["타임라인", llm.input_timeline, llm.source_timeline ?? llm.input_source_timeline],
+  ];
+  const counts = countPairs
+    .filter(([, included]) => Number.isFinite(included))
+    .map(([label, included, source]) =>
+      Number.isFinite(source)
+        ? `${label} ${included}/${source}`
+        : `${label} ${included}`,
+    )
+    .join(", ");
+  const countText = counts ? ` (${escapeHtml(counts)})` : "";
+  return `<div class="llm-warning"><strong>LM 입력 범위 안내:</strong> 전체 CAT 분석 중 우선순위가 높은 근거 일부만 LM Studio에 전달되었습니다${countText}. 보고서의 증거 한계와 탐지 결과 탭을 함께 확인하세요.</div>`;
 }
 
 function renderParserWarning(analysis) {
@@ -325,6 +349,12 @@ function renderFindings(analysisOrFindings) {
   const scenarioCandidates = canonicalScenarios.length
     ? canonicalScenarios
     : compatibleScenarios;
+  const networkActivity =
+    analysis.network_activity &&
+    typeof analysis.network_activity === "object" &&
+    !Array.isArray(analysis.network_activity)
+      ? analysis.network_activity
+      : null;
 
   let suspiciousHtml = "";
   if (suspiciousEvents.length) {
@@ -344,10 +374,80 @@ function renderFindings(analysisOrFindings) {
       <h2 id="suspiciousEventsTitle">의심 이벤트</h2>
       <div class="finding-list">${suspiciousHtml}</div>
     </section>
+    ${renderNetworkActivityGroups(networkActivity)}
     <section aria-labelledby="scenarioCandidatesTitle">
       <h2 id="scenarioCandidatesTitle">공격 시나리오 후보</h2>
       <div class="finding-list">${scenarioHtml}</div>
     </section>`;
+}
+
+function renderNetworkActivityGroups(activity) {
+  if (!activity) return "";
+  const connections = asList(activity.connections).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const groupHtml = connections.length
+    ? connections.map(renderNetworkConnectionGroup).join("")
+    : `<p>현재 입력에서 정규화할 수 있는 네트워크 연결 그룹이 없습니다.</p>`;
+  const scope = activity.limitation
+    ? `<p><strong>분석 범위와 한계:</strong> ${escapeHtml(activity.limitation)}</p>`
+    : "";
+  return `<section aria-labelledby="networkActivityTitle">
+    <h2 id="networkActivityTitle">네트워크 통신 그룹</h2>
+    <p>프로세스·목적지·포트·프로토콜·방향이 같은 통신을 묶은 조사용 요약입니다. 외부 또는 반복 통신이라는 이유만으로 침해가 확정되지는 않습니다.</p>
+    ${scope}
+    <div class="finding-list">${groupHtml}</div>
+  </section>`;
+}
+
+function renderNetworkConnectionGroup(group) {
+  const destinationAddress = formatNetworkEndpoint(
+    eventValue(group, "destination_ip", "DestinationIp", "DestAddress"),
+    eventValue(group, "destination_port", "DestinationPort", "DestPort"),
+  );
+  const destinationNames = uniqueText([
+    destinationAddress,
+    eventValue(group, "destination_hostname", "DestinationHostname"),
+    ...asList(group.dns_queries),
+  ]);
+  const source = formatNetworkEndpoint(
+    eventValue(group, "source_ip", "SourceIp", "SourceAddress"),
+    eventValue(group, "source_port", "SourcePort"),
+  );
+  const process = eventValue(group, "process", "Image", "Application");
+  const processId = eventValue(group, "process_id", "ProcessId", "ProcessID");
+  const processGuid = eventValue(group, "process_guid", "ProcessGuid");
+  const protocol = eventValue(group, "protocol", "Protocol");
+  const direction = eventValue(group, "network_direction", "Direction");
+  const severity = group.suspicious === true ? "medium" : "info";
+  const destinationLabel = destinationNames[0] || "목적지 미상";
+  const connectionCount = Number(group.connection_count || 0);
+  const countLabel = Number.isFinite(connectionCount)
+    ? connectionCount.toLocaleString()
+    : "-";
+  return `<section class="finding ${severity}">
+    <h3>${escapeHtml(process || "프로세스 미상")} → ${escapeHtml(destinationLabel)}</h3>
+    <div class="meta">
+      <span class="pill">${group.suspicious === true ? "의심 후보" : "관측 통신"}</span>
+      <span class="pill">${escapeHtml(countLabel)}회</span>
+      <span class="pill">${escapeHtml(group.first_seen || "-")} ~ ${escapeHtml(group.last_seen || "-")}</span>
+    </div>
+    <table class="evidence-table">
+      <thead><tr><th>출발지</th><th>목적지 / DNS</th><th>프로토콜 / 방향</th><th>프로세스 / PID·GUID</th></tr></thead>
+      <tbody><tr>
+        <td>${escapeHtml(source || "-")}</td>
+        <td>${renderMultilineCell(destinationNames)}</td>
+        <td>${renderMultilineCell([protocol, direction])}</td>
+        <td>${renderMultilineCell([
+          process,
+          processId ? `PID ${processId}` : "",
+          processGuid ? `GUID ${processGuid}` : "",
+        ])}</td>
+      </tr></tbody>
+    </table>
+    ${renderValueList("이상 징후", group.anomaly_signals)}
+    ${renderValueList("프로세스·DNS 상관 근거", group.correlation_reasons)}
+  </section>`;
 }
 
 function renderSuspiciousEvent(item) {
@@ -378,14 +478,8 @@ function renderSuspiciousEvent(item) {
     <p><strong>탐지 규칙:</strong> ${ruleIds.length ? ruleIds.map(escapeHtml).join(", ") : "-"}</p>
     ${renderValueList("의심 근거", reasons)}
     <table class="evidence-table">
-      <thead><tr><th>Event ID</th><th>호스트</th><th>계정</th><th>원본 IP</th><th>명령/프로세스</th></tr></thead>
-      <tbody><tr>
-        <td>${escapeHtml(item.event_id || "-")}</td>
-        <td>${escapeHtml(item.host || "-")}</td>
-        <td>${escapeHtml(item.account || "-")}</td>
-        <td>${escapeHtml(item.source_ip || "-")}</td>
-        <td>${escapeHtml(item.command_line || item.process || "-")}</td>
-      </tr></tbody>
+      <thead><tr><th>Event ID</th><th>호스트 / 계정</th><th>출발지</th><th>목적지 / DNS / 통신</th><th>명령 / 프로세스 / PID·GUID</th></tr></thead>
+      <tbody>${renderEvidenceRow(item, false)}</tbody>
     </table>
     <p><strong>원본 위치:</strong> ${escapeHtml(item.provider || "-")} / ${escapeHtml(item.channel || "-")} / ${escapeHtml(item.source_file || "-")} / record ${escapeHtml(item.record_id || "-")}</p>
     ${renderEventFields(item.fields)}
@@ -567,17 +661,9 @@ function displayValue(value) {
 }
 
 function renderFinding(finding) {
-  const evidenceRows = (finding.evidence || [])
-    .map(
-      (item) => `<tr>
-        <td>${escapeHtml(item.time || "-")}</td>
-        <td>${escapeHtml(item.event_id || "-")}</td>
-        <td>${escapeHtml(item.host || "-")}</td>
-        <td>${escapeHtml(item.account || "-")}</td>
-        <td>${escapeHtml(item.source_ip || "-")}</td>
-        <td>${escapeHtml(item.command_line || item.process || "-")}</td>
-      </tr>`,
-    )
+  const evidenceRows = asList(finding.evidence)
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => renderEvidenceRow(item, true))
     .join("");
   return `<section class="finding ${escapeHtml(finding.severity || "info")}">
     <h3>${escapeHtml(finding.title)}</h3>
@@ -589,10 +675,116 @@ function renderFinding(finding) {
     </div>
     <p>${escapeHtml(finding.description || "")}</p>
     <table class="evidence-table">
-      <thead><tr><th>시간</th><th>ID</th><th>호스트</th><th>계정</th><th>원본</th><th>명령/프로세스</th></tr></thead>
+      <thead><tr><th>시간</th><th>ID</th><th>호스트 / 계정</th><th>출발지</th><th>목적지 / DNS / 통신</th><th>명령 / 프로세스 / PID·GUID</th></tr></thead>
       <tbody>${evidenceRows}</tbody>
     </table>
   </section>`;
+}
+
+function renderEvidenceRow(item, includeTime) {
+  const sourceIp = eventValue(item, "source_ip", "SourceIp", "SourceAddress");
+  const sourcePort = eventValue(item, "source_port", "SourcePort");
+  const destinationIp = eventValue(
+    item,
+    "destination_ip",
+    "DestinationIp",
+    "DestAddress",
+  );
+  const destinationPort = eventValue(
+    item,
+    "destination_port",
+    "DestinationPort",
+    "DestPort",
+  );
+  const destinationNames = uniqueText([
+    eventValue(item, "destination_hostname", "DestinationHostname"),
+    eventValue(item, "destination_domain", "domain"),
+    eventValue(item, "query_name", "QueryName"),
+  ]);
+  const protocol = eventValue(item, "protocol", "Protocol");
+  const direction = eventValue(item, "network_direction", "Direction");
+  const initiated = eventValue(item, "initiated", "Initiated");
+  const process = eventValue(item, "command_line", "process", "Image", "Application");
+  const processId = eventValue(
+    item,
+    "process_id",
+    "ProcessId",
+    "ProcessID",
+    "NewProcessId",
+  );
+  const processGuid = eventValue(item, "process_guid", "ProcessGuid");
+  const source = formatNetworkEndpoint(sourceIp, sourcePort);
+  const destination = uniqueText([
+    formatNetworkEndpoint(destinationIp, destinationPort),
+    ...destinationNames,
+    protocol ? `protocol ${protocol}` : "",
+    direction ? `direction ${direction}` : "",
+    initiated ? `initiated ${initiated}` : "",
+  ]);
+  const processDetails = uniqueText([
+    process,
+    processId ? `PID ${processId}` : "",
+    processGuid ? `GUID ${processGuid}` : "",
+  ]);
+  const prefixCells = [];
+  if (includeTime) prefixCells.push(item.time || "-");
+  prefixCells.push(item.event_id || "-");
+  const escapedPrefixCells = prefixCells
+    .map((value) => `<td>${escapeHtml(value)}</td>`)
+    .join("");
+  const hostAccountCell = renderMultilineCell([item.host, item.account]);
+  const destinationCell = destination.length
+    ? destination.map(escapeHtml).join("<br>")
+    : "-";
+  const processCell = processDetails.length
+    ? processDetails.map(escapeHtml).join("<br>")
+    : "-";
+  return `<tr>${escapedPrefixCells}<td>${hostAccountCell}</td><td>${escapeHtml(source || "-")}</td><td>${destinationCell}</td><td>${processCell}</td></tr>`;
+}
+
+function renderMultilineCell(values) {
+  const items = uniqueText(values);
+  return items.length ? items.map(escapeHtml).join("<br>") : "-";
+}
+
+function eventValue(item, ...names) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+  const sources = [item];
+  if (item.fields && typeof item.fields === "object" && !Array.isArray(item.fields)) {
+    sources.push(item.fields);
+  }
+  const normalizedNames = names.map(normalizeEventFieldName).filter(Boolean);
+  for (const source of sources) {
+    for (const name of names) {
+      if (Object.prototype.hasOwnProperty.call(source, name)) {
+        const value = displayValue(source[name]);
+        if (value) return value;
+      }
+    }
+    for (const [key, rawValue] of Object.entries(source)) {
+      const normalizedKey = normalizeEventFieldName(key);
+      if (!normalizedNames.some((name) => normalizedKey === name || normalizedKey.endsWith(name))) {
+        continue;
+      }
+      const value = displayValue(rawValue);
+      if (value) return value;
+    }
+  }
+  return "";
+}
+
+function normalizeEventFieldName(value) {
+  return String(value || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function formatNetworkEndpoint(address, port) {
+  const safeAddress = displayValue(address);
+  const safePort = displayValue(port);
+  if (!safeAddress) return safePort ? `port ${safePort}` : "";
+  if (!safePort) return safeAddress;
+  return safeAddress.includes(":")
+    ? `[${safeAddress}]:${safePort}`
+    : `${safeAddress}:${safePort}`;
 }
 
 function renderSummary(analysis) {
@@ -600,12 +792,42 @@ function renderSummary(analysis) {
   const scope = analysis.scope || {};
   summaryView.innerHTML = `${renderParserWarning(analysis)}<div class="summary-grid">
     ${renderScope(scope)}
+    ${renderNetworkActivity(analysis.network_activity)}
     ${renderCounter("이벤트 ID", summary.top_event_ids)}
     ${renderCounter("호스트", summary.top_hosts)}
     ${renderCounter("계정", summary.top_accounts)}
     ${renderCounter("원본 IP", summary.top_source_ips)}
+    ${renderCounter("목적지 IP", summary.top_destination_ips)}
+    ${renderCounter("목적지 호스트 / DNS", summary.top_destination_domains)}
     ${renderCounter("프로바이더", summary.top_providers)}
   </div>`;
+}
+
+function renderNetworkActivity(activity) {
+  if (!activity || typeof activity !== "object" || Array.isArray(activity)) return "";
+  const rows = [
+    ["네트워크 연결 이벤트", activity.connection_event_count],
+    ["DNS 질의 이벤트", activity.dns_query_event_count],
+    ["외부 목적지 연결", activity.external_connection_count],
+    ["고유 외부 목적지", activity.unique_external_destination_count],
+    ["통신 그룹", activity.group_count],
+    ["의심 통신 그룹", activity.suspicious_group_count],
+  ]
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(
+      ([label, value]) =>
+        `<tr><td>${escapeHtml(label)}</td><td>${Number(value || 0).toLocaleString()}건</td></tr>`,
+    )
+    .join("");
+  if (!rows) return "";
+  const limitation = activity.limitation
+    ? `<p><strong>해석 한계:</strong> ${escapeHtml(activity.limitation)}</p>`
+    : "";
+  return `<section class="summary-block">
+    <h3>네트워크 통신 범위</h3>
+    <table><tbody>${rows}</tbody></table>
+    ${limitation}
+  </section>`;
 }
 
 function renderScope(scope) {
@@ -700,7 +922,7 @@ function startProgress() {
     let percent = Math.min(88, 8 + elapsed * 2);
     let message = "파일 업로드 중";
     if (elapsed > 6) {
-      message = "EVTX 파싱 및 시간 범위 필터링 중";
+      message = "EVTX/XML 스트리밍 파싱 및 시간 범위 필터링 중";
       percent = Math.min(70, 25 + elapsed * 1.5);
     }
     if (elapsed > 20) {
