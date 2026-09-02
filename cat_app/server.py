@@ -107,6 +107,14 @@ def _env_allowed_origins(name: str) -> set[tuple[str, str, int]]:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
+CAT_IMAGE_ROOT = PROJECT_ROOT / "images"
+CAT_IMAGE_ASSETS = {
+    "/asset/cat.jpg": CAT_IMAGE_ROOT / "cat.jpg",
+    "/asset/cat_down.jpg": CAT_IMAGE_ROOT / "cat_down.jpg",
+    "/asset/cat_dress.jpg": CAT_IMAGE_ROOT / "cat_dress.jpg",
+    "/asset/cat_sleep.jpg": CAT_IMAGE_ROOT / "cat_sleep.jpg",
+    "/asset/cat_sleep2.jpg": CAT_IMAGE_ROOT / "cat_sleep2.jpg",
+}
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_FORM_FIELD_BYTES = 1024 * 1024
 MAX_TOTAL_FORM_FIELD_BYTES = 2 * 1024 * 1024
@@ -284,8 +292,9 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
-        if self.path.split("?", 1)[0] == "/asset/cat.jpg":
-            self._serve_static(PROJECT_ROOT / "cat.jpg")
+        asset_path = CAT_IMAGE_ASSETS.get(self.path.split("?", 1)[0])
+        if asset_path is not None:
+            self._serve_static(asset_path)
             return
         if self.path.split("?", 1)[0] in {"/asset/nyan_cat.gif", "/asset/nyan-cat.gif"}:
             self._serve_static(_existing_asset("nyan_cat.gif", "nyan-cat.gif"))

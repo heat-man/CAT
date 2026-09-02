@@ -16,7 +16,6 @@ CHECKSUMS_NAME = "SHA256SUMS"
 WHEEL_CHECKSUMS_PATH = "vendor/wheels/SHA256SUMS"
 REQUIRED_RUNTIME_FILES = {
     "README.md",
-    "cat.jpg",
     "cat_app/__init__.py",
     "cat_app/analyzer.py",
     "cat_app/evtx_reader.py",
@@ -24,6 +23,11 @@ REQUIRED_RUNTIME_FILES = {
     "cat_app/reporting.py",
     "cat_app/server.py",
     "cat_app/timeutil.py",
+    "images/cat.jpg",
+    "images/cat_down.jpg",
+    "images/cat_dress.jpg",
+    "images/cat_sleep.jpg",
+    "images/cat_sleep2.jpg",
     "nyan-cat.gif",
     "requirements.offline.txt",
     "requirements.txt",

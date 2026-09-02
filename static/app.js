@@ -17,12 +17,53 @@ const lmModel = document.querySelector("#lmModel");
 const progressFill = document.querySelector("#progressFill");
 const progressCat = document.querySelector("#progressCat");
 const loadingText = document.querySelector("#loadingText");
+const catSelector = document.querySelector("#catSelector");
+const mainCatImage = document.querySelector("#mainCatImage");
+const previousCatButton = document.querySelector("#previousCatButton");
+const nextCatButton = document.querySelector("#nextCatButton");
+
+const LM_URL_PREFERENCE_KEY = "cat.lm_url";
+const LM_URL_DEFAULT_MIGRATION_KEY = "cat.lm_url_default_migration_v2";
+const LEGACY_LM_STUDIO_DEFAULTS = new Set([
+  "http://127.0.0.1:1234",
+  "http://127.0.0.1:1234/v1",
+  "http://127.0.0.1:1234/v1/chat/completions",
+]);
+
+const CAT_IMAGES = Object.freeze([
+  {
+    id: "cat.jpg",
+    src: "/asset/cat.jpg",
+    alt: "선글라스를 쓴 회색 고양이",
+  },
+  {
+    id: "cat_down.jpg",
+    src: "/asset/cat_down.jpg",
+    alt: "소파 등받이를 내려오는 회색 고양이",
+  },
+  {
+    id: "cat_dress.jpg",
+    src: "/asset/cat_dress.jpg",
+    alt: "빨간 드레스를 입은 회색 고양이",
+  },
+  {
+    id: "cat_sleep.jpg",
+    src: "/asset/cat_sleep.jpg",
+    alt: "이불 속에서 얼굴을 내민 회색 고양이",
+  },
+  {
+    id: "cat_sleep2.jpg",
+    src: "/asset/cat_sleep2.jpg",
+    alt: "침대에서 웅크려 자는 회색 고양이",
+  },
+]);
 
 let lastReport = "";
 let lastAnalysis = null;
 let maxUploadBytes = 512 * 1024 * 1024;
 let progressTimer = null;
 let progressStart = 0;
+let currentCatImageIndex = 0;
 
 async function loadHealth() {
   try {
@@ -35,7 +76,7 @@ async function loadHealth() {
     configureAgentBackends(data);
     if (data.lm_studio_url && lmUrl) {
       lmUrl.value = data.allow_custom_lm_url === true
-        ? readPreference("cat.lm_url") || data.lm_studio_url
+        ? preferredLmUrl(data.lm_studio_url)
         : data.lm_studio_url;
     }
     if (lmUrl) {
@@ -201,9 +242,12 @@ form.addEventListener("submit", async (event) => {
 
 fileInput.addEventListener("change", updateFileSummary);
 agentBackend?.addEventListener("change", updateAgentFields);
-lmUrl?.addEventListener("change", () => writePreference("cat.lm_url", lmUrl.value.trim()));
+lmUrl?.addEventListener("change", () => writePreference(LM_URL_PREFERENCE_KEY, lmUrl.value.trim()));
 lmModel?.addEventListener("change", () => writePreference("cat.lm_model", lmModel.value.trim()));
 savePdfButton?.addEventListener("click", saveReportAsPdf);
+previousCatButton?.addEventListener("click", () => selectCatImage(-1));
+nextCatButton?.addEventListener("click", () => selectCatImage(1));
+catSelector?.addEventListener("keydown", handleCatSelectorKeydown);
 
 for (const eventName of ["dragenter", "dragover"]) {
   fileDrop.addEventListener(eventName, (event) => {
@@ -251,8 +295,7 @@ function handleTabKeydown(event) {
   if (event.key === "ArrowRight") targetIndex = (currentIndex + 1) % buttons.length;
   else if (event.key === "ArrowLeft") {
     targetIndex = (currentIndex - 1 + buttons.length) % buttons.length;
-  }
-  else if (event.key === "Home") targetIndex = 0;
+  } else if (event.key === "Home") targetIndex = 0;
   else if (event.key === "End") targetIndex = buttons.length - 1;
   else return;
 
@@ -383,6 +426,50 @@ function writePreference(key, value) {
   } catch {
     // Storage can be disabled by browser policy; the current form value still works.
   }
+}
+
+function preferredLmUrl(serverDefault) {
+  const saved = readPreference(LM_URL_PREFERENCE_KEY).trim();
+  const migrationDone = readPreference(LM_URL_DEFAULT_MIGRATION_KEY) === "done";
+  if (!migrationDone) {
+    writePreference(LM_URL_DEFAULT_MIGRATION_KEY, "done");
+    const comparable = saved.replace(/\/+$/, "");
+    if (saved && LEGACY_LM_STUDIO_DEFAULTS.has(comparable)) {
+      writePreference(LM_URL_PREFERENCE_KEY, "");
+      return serverDefault;
+    }
+  }
+  return saved || serverDefault;
+}
+
+function initializeCatSelector() {
+  if (!mainCatImage || !CAT_IMAGES.length) return;
+  const preferredId = readPreference("cat.main_image");
+  const preferredIndex = CAT_IMAGES.findIndex((item) => item.id === preferredId);
+  currentCatImageIndex = preferredIndex >= 0 ? preferredIndex : 0;
+  renderCatImage();
+}
+
+function selectCatImage(direction) {
+  if (!mainCatImage || !CAT_IMAGES.length) return;
+  currentCatImageIndex = (
+    currentCatImageIndex + direction + CAT_IMAGES.length
+  ) % CAT_IMAGES.length;
+  renderCatImage();
+  writePreference("cat.main_image", CAT_IMAGES[currentCatImageIndex].id);
+}
+
+function renderCatImage() {
+  if (!mainCatImage) return;
+  const selected = CAT_IMAGES[currentCatImageIndex];
+  mainCatImage.src = selected.src;
+  mainCatImage.alt = selected.alt;
+}
+
+function handleCatSelectorKeydown(event) {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  selectCatImage(event.key === "ArrowLeft" ? -1 : 1);
 }
 
 function resolveAnalysisPayload(data) {
@@ -1029,4 +1116,5 @@ function updateProgress(percent, message) {
   loadingText.textContent = message;
 }
 
+initializeCatSelector();
 loadHealth();

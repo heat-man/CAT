@@ -13,10 +13,10 @@ HTTP 연결 실패나 빈 응답처럼 사용할 모델 결과가 없으면 분�
 ## 기본 endpoint
 
 ```text
-http://127.0.0.1:1234/v1/chat/completions
+http://192.168.100.1:1234/v1/chat/completions
 ```
 
-LM Studio가 CAT와 같은 Windows 호스트에 있으면 다음처럼 loopback을 권장합니다.
+이 기본값은 CAT VM에서 VMware 호스트 인터페이스의 LM Studio에 연결하는 배치를 전제로 합니다. LM Studio가 CAT와 같은 Windows 호스트에 있으면 다음처럼 loopback으로 덮어쓸 수 있습니다.
 
 ```powershell
 $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
@@ -88,7 +88,7 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 운용 예:
 
 ```powershell
-$env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
+$env:LM_STUDIO_URL = "http://192.168.100.1:1234/v1/chat/completions"
 $env:LM_STUDIO_MODEL = "<정확한 /v1/models ID>"
 $env:CAT_LM_TIMEOUT_SECONDS = "900"
 $env:CAT_LM_MAX_TOKENS = "32768"

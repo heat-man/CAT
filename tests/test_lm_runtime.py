@@ -97,6 +97,7 @@ class LMRuntimeTests(unittest.TestCase):
             mock.patch.multiple(
                 reporting,
                 DEFAULT_LM_API_KEY="secret-token",
+                DEFAULT_LM_STUDIO_URL=f"{self.base_url}/v1/chat/completions",
                 DEFAULT_LM_MAX_TOKENS=12345,
                 DEFAULT_LM_TEMPERATURE=0.7,
                 DEFAULT_LM_TOP_P=0.8,
@@ -343,6 +344,33 @@ class LMRuntimeTests(unittest.TestCase):
                     "CAT_LM_ALLOWED_ORIGINS",
                 ):
                     server._resolve_lm_url({"lm_url": blocked})
+
+        configured_lan_endpoint = (
+            "http://192.168.100.1:1234/v1/chat/completions"
+        )
+        with (
+            mock.patch.object(
+                server,
+                "DEFAULT_LM_STUDIO_URL",
+                configured_lan_endpoint,
+            ),
+            mock.patch.object(server, "ALLOW_CUSTOM_LM_URL", True),
+            mock.patch.object(server, "CUSTOM_LM_ALLOWED_ORIGINS", set()),
+        ):
+            for submitted in (
+                "http://192.168.100.1:1234",
+                "http://192.168.100.1:1234/v1",
+                configured_lan_endpoint,
+            ):
+                with self.subTest(configured_endpoint_form=submitted):
+                    self.assertEqual(
+                        server._resolve_lm_url({"lm_url": submitted}),
+                        configured_lan_endpoint,
+                    )
+            with self.assertRaisesRegex(ValueError, "CAT_LM_ALLOWED_ORIGINS"):
+                server._resolve_lm_url(
+                    {"lm_url": "http://192.168.100.2:1234"}
+                )
 
     def test_custom_origin_configuration_is_exact_and_validated(self) -> None:
         with mock.patch.dict(
@@ -1099,9 +1127,17 @@ class LMRuntimeTests(unittest.TestCase):
         index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn('value="http://172.16.100.51:1234"', index)
+        self.assertIn('placeholder="http://192.168.100.1:1234"', index)
+        self.assertNotIn("lmUrlHelp", index)
+        self.assertNotIn("기본 호스트 주소이며", index)
         self.assertNotIn('value="qwen"', index)
         self.assertNotIn('<option value="codex_dev"', index)
         self.assertIn("data.lm_studio_url", app)
+        self.assertIn("data.allow_custom_lm_url === true", app)
+        self.assertIn("preferredLmUrl(data.lm_studio_url)", app)
+        self.assertIn("LEGACY_LM_STUDIO_DEFAULTS", app)
+        self.assertIn("LM_URL_DEFAULT_MIGRATION_KEY", app)
+        self.assertIn('=== "done"', app)
         self.assertIn("data.default_model", app)
         self.assertIn("renderParserWarning", app)
         self.assertIn("입력 파싱 경고", app)
@@ -1307,12 +1343,38 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         self.assertEqual(defaults["max_input_chars"], 48 * 1024)
         self.assertEqual(
             defaults["url"],
-            "http://127.0.0.1:1234/v1/chat/completions",
+            "http://192.168.100.1:1234/v1/chat/completions",
         )
         run_sh = (ROOT / "scripts" / "run.sh").read_text(encoding="utf-8")
         run_ps1 = (ROOT / "scripts" / "run.ps1").read_text(encoding="utf-8")
         self.assertIn("${HOST:-0.0.0.0}", run_sh)
         self.assertIn('else { "0.0.0.0" }', run_ps1)
+
+    def test_lm_studio_url_environment_override_is_normalized(self) -> None:
+        environment = os.environ.copy()
+        environment["LM_STUDIO_URL"] = "https://lm.internal:5678/v1"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from cat_app.reporting import DEFAULT_LM_STUDIO_URL; "
+                    "print(DEFAULT_LM_STUDIO_URL)"
+                ),
+            ],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=True,
+        )
+
+        self.assertEqual(
+            completed.stdout.strip(),
+            "https://lm.internal:5678/v1/chat/completions",
+        )
 
     def test_lm_timeout_override_is_bounded_without_changing_default(self) -> None:
         _report, status = reporting.generate_report(

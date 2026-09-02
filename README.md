@@ -57,12 +57,12 @@ py -3 --version
 
 ### 3. LM Studio 설정
 
-LM Studio에서 모델을 로드하고 OpenAI 호환 API 서버를 시작합니다.
+LM Studio에서 모델을 로드하고 OpenAI 호환 API 서버를 시작합니다. CAT의 기본 LM Studio 주소는 VMware 호스트 인터페이스를 가리키는 `http://192.168.100.1:1234/v1/chat/completions`입니다.
 
-CAT와 LM Studio가 **같은 VM 또는 PC**에 있으면 다음 주소를 사용합니다.
+CAT VM에서 호스트의 LM Studio를 사용하는 기본 배치에서는 다음과 같이 연결을 확인합니다. 환경 변수를 생략해도 같은 기본값을 사용하지만, 운용 구성을 명시하려면 설정해 두는 것이 좋습니다.
 
 ```powershell
-$env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1"
+$env:LM_STUDIO_URL = "http://192.168.100.1:1234/v1"
 .\.venv\Scripts\python.exe .\scripts\check_lmstudio.py --models-only
 ```
 
@@ -72,7 +72,7 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1"
 $env:LM_STUDIO_MODEL = "<위 명령이 반환한 정확한 id>"
 ```
 
-CAT와 LM Studio가 **다른 장비**에 있으면 [LM Studio가 다른 호스트에 있는 경우](#lm-studio가-다른-호스트에-있는-경우)를 먼저 설정하세요.
+LM Studio가 CAT와 같은 장비에서 실행되는 예외적인 배치에서는 `LM_STUDIO_URL=http://127.0.0.1:1234/v1`로 덮어쓸 수 있습니다. 다른 주소를 사용하는 경우에는 [LM Studio가 다른 호스트에 있는 경우](#lm-studio가-다른-호스트에-있는-경우)를 확인하세요.
 
 선택 사항으로 실제 구조화 보고서까지 엄격하게 점검할 수 있습니다.
 
@@ -102,7 +102,7 @@ Linux/macOS에서는 다음 명령을 사용합니다.
 
 ```bash
 ./scripts/bootstrap_offline.sh
-export LM_STUDIO_URL="http://127.0.0.1:1234/v1"
+export LM_STUDIO_URL="http://192.168.100.1:1234/v1"
 export LM_STUDIO_MODEL="<정확한 모델 id>"
 ./scripts/run.sh
 ```
@@ -127,7 +127,9 @@ export LM_STUDIO_MODEL="<정확한 모델 id>"
 6. `분석 실행`을 누른 뒤 `보고서`, `탐지 결과`, `요약` 탭과 화면 상단의 경고를 확인합니다.
 7. 보고서를 보관하려면 `PDF로 저장`을 누르고 브라우저 인쇄 창에서 PDF 저장 대상을 선택합니다.
 
-브라우저에서 변경한 LM Studio URL과 모델 ID는 해당 브라우저의 로컬 저장소에 보존됩니다. 서버 환경 변수를 바꾼 뒤 예전 값이 계속 보이면 입력값을 다시 수정하거나 해당 사이트의 저장 데이터를 지우세요.
+브라우저에서 변경한 LM Studio URL과 모델 ID는 해당 브라우저의 로컬 저장소에 보존됩니다. 과거 내장 기본값인 `127.0.0.1:1234`만 저장되어 있으면 현재 서버 기본값으로 자동 전환하고, 사용자가 지정한 다른 주소는 그대로 보존합니다.
+
+분석 전 보고서 영역의 좌우 화살표로 메인 고양이 사진 5장을 순환해 선택할 수 있습니다. 선택한 사진은 `cat.main_image` 키로 해당 브라우저의 로컬 저장소에 보존되며, 분석 API나 LM Studio로 전달되지 않습니다. 정적 이미지 요청 경로는 일반 웹 요청과 마찬가지로 CAT 서버 접근 로그에 남을 수 있습니다.
 
 ### 7. 보고서를 PDF로 저장
 
@@ -189,9 +191,11 @@ New-NetFirewallRule `
 
 CAT는 다음 세 형식을 모두 받아 실제 Chat Completions endpoint로 정규화합니다.
 
-- base URL: `http://192.168.100.20:1234`
-- `/v1` URL: `http://192.168.100.20:1234/v1`
-- 전체 URL: `http://192.168.100.20:1234/v1/chat/completions`
+- base URL: `http://192.168.100.1:1234`
+- `/v1` URL: `http://192.168.100.1:1234/v1`
+- 전체 URL: `http://192.168.100.1:1234/v1/chat/completions`
+
+웹의 `LM Studio URL` 입력란에서도 세 형식을 모두 사용할 수 있습니다. `CAT_ALLOW_CUSTOM_LM_URL=true`가 기본이므로 주소를 직접 바꿀 수 있습니다.
 
 ### LM Studio가 CAT와 같은 호스트에 있는 경우
 
@@ -203,20 +207,20 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1"
 
 ### LM Studio가 다른 호스트에 있는 경우
 
-예를 들어 CAT VM은 `192.168.100.1`, LM Studio 호스트는 `192.168.100.20`이라고 가정합니다.
+기본 배치처럼 CAT VM에서 VMware 호스트 `192.168.100.1`의 LM Studio를 사용한다고 가정합니다.
 
 1. LM Studio API가 loopback 전용이 아닌, CAT VM에서 도달 가능한 인터페이스에서 수신하도록 설정합니다.
 2. LM Studio 호스트의 방화벽에서 **CAT 서버 IP → TCP 1234**만 허용합니다.
 3. CAT VM에서 연결을 확인합니다.
 
 ```powershell
-Test-NetConnection 192.168.100.20 -Port 1234
+Test-NetConnection 192.168.100.1 -Port 1234
 ```
 
 4. CAT를 시작할 같은 PowerShell 창에서 주 endpoint를 설정합니다.
 
 ```powershell
-$env:LM_STUDIO_URL = "http://192.168.100.20:1234/v1"
+$env:LM_STUDIO_URL = "http://192.168.100.1:1234/v1"
 .\.venv\Scripts\python.exe .\scripts\check_lmstudio.py --models-only
 $env:LM_STUDIO_MODEL = "<정확한 모델 id>"
 .\scripts\run.ps1
@@ -252,7 +256,7 @@ API key는 기본적으로 주 `LM_STUDIO_URL`에만 전달됩니다. 신뢰한 
 |---|---|---|
 | `CAT_HOST` | `0.0.0.0` | CAT 웹 서버 바인드 주소 |
 | `PORT` | `8000` | CAT 웹 서버 포트 |
-| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1/chat/completions` | CAT 서버가 사용할 주 LM Studio endpoint |
+| `LM_STUDIO_URL` | `http://192.168.100.1:1234/v1/chat/completions` | CAT 서버가 사용할 주 LM Studio endpoint |
 | `LM_STUDIO_MODEL` | `qwen/qwen3.6-35b-a3b` | `/v1/models`의 정확한 모델 ID |
 | `CAT_ALLOW_CUSTOM_LM_URL` | `true` | 브라우저에서 LM Studio 주소 변경 허용 |
 | `CAT_LM_ALLOWED_ORIGINS` | 빈값 | UI에서 선택할 추가 LM origin 목록 |

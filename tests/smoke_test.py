@@ -27,6 +27,15 @@ def main() -> None:
     _require(version("python-evtx") == "0.8.1", "python-evtx version mismatch")
     _require(version("tzdata") == "2026.3", "tzdata version mismatch")
 
+    for relative in (
+        "images/cat.jpg",
+        "images/cat_down.jpg",
+        "images/cat_dress.jpg",
+        "images/cat_sleep.jpg",
+        "images/cat_sleep2.jpg",
+    ):
+        _require((ROOT / relative).is_file(), f"cat image missing: {relative}")
+
     _require(get_timezone("UTC") is timezone.utc, "UTC timezone fallback failed")
     seoul = get_timezone("Asia/Seoul")
     _require(isinstance(seoul, ZoneInfo), "Asia/Seoul did not resolve with ZoneInfo")

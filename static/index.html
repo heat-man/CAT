@@ -60,7 +60,7 @@
             </label>
             <label>
               <span>LM Studio URL</span>
-              <input name="lm_url" id="lmUrl" type="url" autocomplete="off" placeholder="http://127.0.0.1:1234" />
+              <input name="lm_url" id="lmUrl" type="url" autocomplete="off" placeholder="http://192.168.100.1:1234" />
             </label>
             <label>
               <span>모델</span>
@@ -109,8 +109,39 @@
           aria-labelledby="reportTab"
           tabindex="0"
         >
-          <div class="empty-state" aria-hidden="true">
-            <img src="/asset/cat.jpg" alt="" />
+          <div class="empty-state">
+            <div
+              id="catSelector"
+              class="cat-selector"
+              role="region"
+              aria-roledescription="캐러셀"
+              aria-label="메인 고양이 사진 선택"
+            >
+              <img
+                id="mainCatImage"
+                src="/asset/cat.jpg"
+                alt="선글라스를 쓴 회색 고양이"
+                draggable="false"
+              />
+              <button
+                id="previousCatButton"
+                class="cat-selector-button previous"
+                type="button"
+                aria-label="이전 고양이 사진"
+                aria-controls="mainCatImage"
+              >
+                <span aria-hidden="true">&#10094;</span>
+              </button>
+              <button
+                id="nextCatButton"
+                class="cat-selector-button next"
+                type="button"
+                aria-label="다음 고양이 사진"
+                aria-controls="mainCatImage"
+              >
+                <span aria-hidden="true">&#10095;</span>
+              </button>
+            </div>
           </div>
         </article>
         <article id="findingsView" class="tab-view hidden" role="tabpanel" aria-labelledby="findingsTab" tabindex="0"></article>

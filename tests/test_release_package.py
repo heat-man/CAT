@@ -59,6 +59,19 @@ class ReleasePackageTests(unittest.TestCase):
 
             with zipfile.ZipFile(zip_path) as archive:
                 names = {info.filename for info in archive.infolist()}
+            package_root = zip_result["package_root"]
+            expected_cat_images = {
+                f"{package_root}/images/{name}"
+                for name in (
+                    "cat.jpg",
+                    "cat_down.jpg",
+                    "cat_dress.jpg",
+                    "cat_sleep.jpg",
+                    "cat_sleep2.jpg",
+                )
+            }
+            self.assertTrue(expected_cat_images.issubset(names))
+            self.assertNotIn(f"{package_root}/cat.jpg", names)
             forbidden = (
                 "reports/",
                 ".agents/",

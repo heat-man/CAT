@@ -98,7 +98,7 @@ def _env_chat_endpoints(name: str) -> tuple[str, ...]:
 
 _CONFIGURED_LM_STUDIO_URL = os.getenv(
     "LM_STUDIO_URL",
-    "http://127.0.0.1:1234/v1/chat/completions",
+    "http://192.168.100.1:1234/v1/chat/completions",
 )
 try:
     DEFAULT_LM_STUDIO_URL = _normalize_chat_endpoint_value(_CONFIGURED_LM_STUDIO_URL)

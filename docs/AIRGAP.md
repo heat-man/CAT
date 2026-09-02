@@ -109,6 +109,8 @@ $env:VENV_DIR = "C:\CAT\venv"
 
 LM Studio 0.4.8 이상에서 반입한 Qwen3.6-35B-A3B를 로드하고 OpenAI 호환 로컬 서버를 시작합니다. CAT의 canonical 기본 모델 ID는 `qwen/qwen3.6-35b-a3b`입니다. 마케팅 이름이나 파일명이 아니라 `/v1/models`의 `id`를 CAT 모델 값으로 사용하며, 독립망 서버가 다른 ID를 반환하면 `LM_STUDIO_MODEL`로 그 값을 설정합니다.
 
+CAT의 기본 LM Studio endpoint는 VM에서 VMware 호스트 인터페이스로 연결하는 `http://192.168.100.1:1234/v1/chat/completions`입니다. 아래는 LM Studio를 CAT와 같은 호스트에서 실행할 때의 loopback override 예시입니다.
+
 같은 호스트 예시:
 
 ```powershell
