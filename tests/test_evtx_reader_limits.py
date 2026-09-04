@@ -7,6 +7,8 @@ import unittest
 from unittest import mock
 
 from cat_app import evtx_reader
+from cat_app.analyzer import analyze_events
+from cat_app.models import EventRecord, ParseResult
 
 
 def _event(record_id: int, text: str = "ok") -> str:
@@ -15,6 +17,33 @@ def _event(record_id: int, text: str = "ok") -> str:
     <Provider Name="Test"/><EventID>4688</EventID><EventRecordID>{record_id}</EventRecordID>
   </System>
   <EventData><Data Name="CommandLine">{text}</Data></EventData>
+</Event>"""
+
+
+def _timed_event(record_id: int, timestamp: str) -> str:
+    return _event(record_id).replace(
+        "</System>",
+        f'<TimeCreated SystemTime="{timestamp}"/></System>',
+    )
+
+
+def _sysmon_event(
+    record_id: int,
+    event_id: int,
+    event_data: dict[str, str] | None = None,
+) -> str:
+    fields = "".join(
+        f'<Data Name="{name}">{value}</Data>'
+        for name, value in (event_data or {}).items()
+    )
+    return f"""<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon"/>
+    <EventID>{event_id}</EventID>
+    <EventRecordID>{record_id}</EventRecordID>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+  </System>
+  <EventData>{fields}</EventData>
 </Event>"""
 
 
@@ -51,7 +80,7 @@ class XMLReaderLimitTests(unittest.TestCase):
         self.assertEqual([record.record_id for record in result.records], ["1"])
         self.assertEqual(result.errors, [])
 
-    def test_record_limit_stops_before_malformed_tail(self) -> None:
+    def test_record_limit_still_scans_and_reports_malformed_tail(self) -> None:
         valid = "".join(_event(index) for index in range(1, 4))
         content = f"<Events>{valid}{' ' * 512}<broken"
         with tempfile.TemporaryDirectory() as directory:
@@ -63,7 +92,193 @@ class XMLReaderLimitTests(unittest.TestCase):
         self.assertEqual(result.total_seen, 3)
         self.assertEqual(result.total_in_range, 3)
         self.assertTrue(result.truncated)
+        self.assertTrue(result.record_limit_reached)
+        self.assertFalse(result.network_scan_complete)
+        self.assertFalse(result.files[0]["scan_complete"])
+        self.assertIn("unclosed token", result.errors[0])
+
+    def test_record_limit_caps_retention_but_counts_the_entire_file(self) -> None:
+        content = "<Events>" + "".join(_event(index) for index in range(1, 6)) + "</Events>"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, content)
+            result = evtx_reader.parse_event_files([path], None, None, 2)
+
+        self.assertEqual([record.record_id for record in result.records], ["1", "2"])
+        self.assertEqual(result.total_seen, 5)
+        self.assertEqual(result.total_in_range, 5)
+        self.assertTrue(result.truncated)
+        self.assertTrue(result.record_limit_reached)
+        self.assertFalse(result.retention_limit_reached)
+        self.assertTrue(result.network_scan_complete)
         self.assertEqual(result.errors, [])
+        self.assertEqual(result.files[0]["events_seen"], 5)
+        self.assertEqual(result.files[0]["records_retained"], 2)
+        self.assertTrue(result.files[0]["scan_complete"])
+
+    def test_parser_tracks_events_outside_requested_range_for_adaptive_context(self) -> None:
+        content = (
+            "<Events>"
+            + _timed_event(1, "2026-09-01T09:00:00Z")
+            + _timed_event(2, "2026-09-01T10:30:00Z")
+            + _timed_event(3, "2026-09-01T12:30:00Z")
+            + "</Events>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, content)
+            result = evtx_reader.parse_event_files(
+                [path],
+                evtx_reader.parse_event_time("2026-09-01T10:00:00Z"),
+                evtx_reader.parse_event_time("2026-09-01T12:00:00Z"),
+                10,
+            )
+        self.addCleanup(result.close)
+
+        self.assertEqual([record.record_id for record in result.records], ["2"])
+        self.assertEqual(result.events_before_range, 1)
+        self.assertEqual(result.events_after_range, 1)
+        metadata = result.to_dict()
+        self.assertEqual(metadata["earliest_event_time"], "2026-09-01T09:00:00Z")
+        self.assertEqual(metadata["latest_event_time"], "2026-09-01T12:30:00Z")
+
+    def test_network_spool_includes_relevant_events_after_record_limit(self) -> None:
+        content = (
+            "<Events>"
+            + _event(1)
+            + _event(2)
+            + _sysmon_event(
+                3,
+                3,
+                {
+                    "ProcessGuid": "{11111111-2222-3333-4444-555555555555}",
+                    "Image": r"C:\\Users\\alice\\payload.exe",
+                    "DestinationIp": "203.0.113.10",
+                    "DestinationPort": "4444",
+                },
+            )
+            + _sysmon_event(
+                4,
+                22,
+                {
+                    "ProcessGuid": "{11111111-2222-3333-4444-555555555555}",
+                    "QueryName": "control.example.test",
+                    "QueryResults": "203.0.113.10",
+                },
+            )
+            + "</Events>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, content)
+            with mock.patch.object(evtx_reader, "ANALYSIS_SPOOL_MEMORY_BYTES", 1):
+                result = evtx_reader.parse_event_files([path], None, None, 2)
+
+        first_pass = list(result.iter_network_records())
+        second_pass = list(result.iter_network_records())
+        self.addCleanup(result.close)
+
+        self.assertEqual([record.record_id for record in result.records], ["1", "2"])
+        self.assertEqual(result.total_seen, 4)
+        self.assertEqual(result.network_records_seen, 2)
+        self.assertTrue(result.record_limit_reached)
+        self.assertFalse(result.retention_limit_reached)
+        self.assertTrue(result.network_scan_complete)
+        self.assertEqual([record.event_id for record in first_pass], ["3", "22"])
+        self.assertEqual(
+            [record.record_id for record in second_pass],
+            ["3", "4"],
+        )
+        self.assertEqual(first_pass[0].event_data["DestinationIp"], "203.0.113.10")
+        self.assertEqual(first_pass[1].event_data["QueryName"], "control.example.test")
+        self.assertEqual(first_pass[0].raw_xml, "")
+        analysis = analyze_events(result, None, None)
+        self.assertEqual(analysis["network_activity"]["connection_event_count"], 1)
+        self.assertTrue(analysis["network_activity"]["full_input_scan"])
+        self.assertTrue(analysis["network_activity"]["general_record_limit_reached"])
+        self.assertTrue(
+            any(
+                finding["rule_id"] == "suspicious_network_connection"
+                for finding in analysis["findings"]
+            )
+        )
+
+    def test_network_spool_has_a_hard_byte_limit_and_reports_partial_scan(self) -> None:
+        content = (
+            "<Events>"
+            + _sysmon_event(
+                1,
+                3,
+                {
+                    "Image": r"C:\\Windows\\System32\\svchost.exe",
+                    "DestinationIp": "198.51.100.10",
+                    "DestinationPort": "443",
+                },
+            )
+            + _sysmon_event(
+                2,
+                3,
+                {
+                    "Image": r"C:\\Windows\\System32\\svchost.exe",
+                    "DestinationIp": "198.51.100.11",
+                    "DestinationPort": "443",
+                },
+            )
+            + "</Events>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write(directory, content)
+            with (
+                mock.patch.object(evtx_reader, "ANALYSIS_SPOOL_MAX_BYTES", 1),
+                self.assertLogs(evtx_reader.LOGGER, level="WARNING") as captured,
+            ):
+                result = evtx_reader.parse_event_files([path], None, None, 10)
+        self.addCleanup(result.close)
+
+        self.assertEqual(result.total_seen, 2)
+        self.assertEqual(result.network_records_seen, 2)
+        self.assertEqual(result.network_records_spooled, 0)
+        self.assertEqual(result.network_spool_bytes, 0)
+        self.assertTrue(result.network_spool_limit_reached)
+        self.assertFalse(result.network_scan_complete)
+        self.assertTrue(result.truncated)
+        self.assertEqual(list(result.iter_network_records()), [])
+        self.assertEqual(result.files[0]["network_records_seen"], 2)
+        self.assertEqual(result.files[0]["network_records_spooled"], 0)
+        self.assertIn("spool limit reached", "\n".join(captured.output))
+        analysis = analyze_events(result, None, None)
+        self.assertEqual(analysis["scope"]["network_records_seen"], 2)
+        self.assertEqual(analysis["scope"]["network_records_scanned"], 0)
+        self.assertEqual(
+            analysis["network_activity"]["input_network_record_count"],
+            2,
+        )
+        self.assertEqual(
+            analysis["network_activity"]["source_network_record_count"],
+            0,
+        )
+        self.assertTrue(
+            analysis["network_activity"]["network_spool_limit_reached"]
+        )
+
+    def test_direct_parse_result_uses_records_as_network_source(self) -> None:
+        event = EventRecord(
+            source_file="manual.evtx",
+            event_id="3",
+            provider="Microsoft-Windows-Sysmon",
+            channel="Microsoft-Windows-Sysmon/Operational",
+            computer="HOST-1",
+            time_created=None,
+            record_id="7",
+            event_data={"DestinationIp": "198.51.100.20"},
+        )
+        result = ParseResult(
+            records=[event],
+            files=[],
+            errors=[],
+            total_seen=1,
+            total_in_range=1,
+        )
+
+        self.assertEqual(list(result.iter_network_records()), [event])
+        self.assertTrue(result.network_scan_complete)
 
     def test_partial_xml_error_marks_result_truncated(self) -> None:
         content = f"<Events>{_event(1)}{_event(2, 'A' * 2000)}</Events>"
@@ -360,7 +575,11 @@ class XMLReaderLimitTests(unittest.TestCase):
 
         self.assertEqual([record.record_id for record in result.records], ["1"])
         self.assertTrue(result.truncated)
-        self.assertIn("retained records exceed", result.errors[0])
+        self.assertTrue(result.record_limit_reached)
+        self.assertTrue(result.retention_limit_reached)
+        self.assertTrue(result.network_scan_complete)
+        self.assertEqual(result.total_seen, 2)
+        self.assertEqual(result.errors, [])
 
     def test_retained_field_budget_is_shared_across_events(self) -> None:
         content = f"<Events>{_event(1)}{_event(2)}</Events>"
@@ -375,7 +594,11 @@ class XMLReaderLimitTests(unittest.TestCase):
 
         self.assertEqual([record.record_id for record in result.records], ["1"])
         self.assertTrue(result.truncated)
-        self.assertIn("retained field count exceeds", result.errors[0])
+        self.assertTrue(result.record_limit_reached)
+        self.assertTrue(result.retention_limit_reached)
+        self.assertTrue(result.network_scan_complete)
+        self.assertEqual(result.total_seen, 2)
+        self.assertEqual(result.errors, [])
 
     def test_xml_deadline_is_absolute_across_parse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

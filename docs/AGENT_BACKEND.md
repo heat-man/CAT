@@ -33,8 +33,8 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 | `LM_STUDIO_MODEL` | `qwen/qwen3.6-35b-a3b` | `/v1/models`의 정확한 ID로 재설정 |
 | `LM_STUDIO_API_KEY` | 없음 | 선택적 Bearer token |
 | `CAT_LM_API_KEY` | 없음 | API key 별칭; `LM_STUDIO_API_KEY`가 우선 |
-| `CAT_LM_TIMEOUT_SECONDS` | `900` | 1~7200초 요청 제한 |
-| `CAT_LM_MAX_TOKENS` | `32768` | 최대 출력 token |
+| `CAT_LM_TIMEOUT_SECONDS` | `900` | 청크 또는 최종 요청 각각의 논리 호출 제한, 1~7200초; 호환 재시도도 같은 제한을 공유 |
+| `CAT_LM_MAX_TOKENS` | `8192` | 최종 응답 최대 출력 token; 64k context 기본 여유를 위한 값, 최대 131072 |
 | `CAT_LM_TEMPERATURE` | `0.7` | sampling temperature |
 | `CAT_LM_TOP_P` | `0.8` | nucleus sampling |
 | `CAT_LM_TOP_K` | `20` | top-k sampling |
@@ -54,6 +54,17 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 | `CAT_LM_ALLOWED_ORIGINS` | 빈값 | 쉼표로 구분한 추가 endpoint origin(`scheme://host:port`) 허용 목록 |
 | `CAT_LM_API_KEY_ALLOWED_ENDPOINTS` | 빈값 | 설정 API key를 전달할 신뢰 endpoint 전체 URL 목록 |
 | `CAT_LM_STRICT_VALIDATION` | `false` | `false`: 자유 형식 응답, `true`: JSON Schema/required section 강제 검증 |
+| `CAT_LM_HIERARCHICAL_ENABLED` | `true` | `strict=false`에서 큰 선별 근거의 시간순 분할·누적 분석 사용 |
+| `CAT_LM_HIERARCHICAL_MIN_EVENTS` | `24` | 계층형 분할을 검토할 최소 canonical 근거 수, 2~10000 |
+| `CAT_LM_HIERARCHICAL_CHUNK_MAX_EVENTS` | `24` | 청크당 최대 근거 수, 2~256 |
+| `CAT_LM_HIERARCHICAL_CHUNK_MAX_CHARS` | `12288` | 청크 근거 문자 예산, 2048~262144; 실제 메시지는 `CAT_LM_MAX_INPUT_CHARS` 이하로 다시 제한 |
+| `CAT_LM_HIERARCHICAL_MAX_CHUNKS` | `8` | 중간 누적 분석의 최대 논리 호출 수, 2~32 |
+| `CAT_LM_HIERARCHICAL_OVERLAP_EVENTS` | `2` | 시간 경계 문맥을 위해 다음 청크에 겹칠 근거 수, 0~8 |
+| `CAT_LM_HIERARCHICAL_SUMMARY_CHARS` | `4096` | metadata와 다음 단계에 보존할 청크 요약 상한, 512~32768자 |
+| `CAT_LM_HIERARCHICAL_CASE_STATE_CHARS` | `8192` | 다음 청크로 넘길 누적 사건 상태 상한, 1024~65536자 |
+| `CAT_LM_HIERARCHICAL_CONTEXT_CHARS` | `20480` | 최종 요청에 넣을 전체 계층형 문맥 상한, 4096~262144자; 실제값은 전체 입력 예산에 맞게 축소 |
+| `CAT_LM_HIERARCHICAL_MAX_TOKENS` | `2048` | 중간 청크 응답 token 상한, 256~8192 및 `CAT_LM_MAX_TOKENS` 이하 |
+| `CAT_LM_HIERARCHICAL_SOURCE_EVENTS` | `10000` | 계층형 후보 수집 단계의 최대 근거 수, 100~100000 |
 | `CAT_BROWSER_ALLOWED_ORIGINS` | 빈값 | HTTPS 역방향 프록시 등에서 허용할 공개 웹 origin(`scheme://host:port`) 목록 |
 | `CAT_UPLOAD_TIMEOUT_SECONDS` | `900` | 업로드 본문 전체 수신 제한, 10~7200초 |
 | `CAT_XML_MAX_FILE_BYTES` | `134217728` | 단일 XML 파일 제한, 최대 512MiB |
@@ -77,6 +88,8 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 | `CAT_XML_MAX_ELEMENTS_PER_FILE` | `5000000` | XML 파일 전체 요소 수 제한 |
 | `CAT_XML_MAX_DEPTH` | `128` | XML 중첩 깊이 제한 |
 | `CAT_XML_PARSE_TIMEOUT_SECONDS` | `300` | XML 스트림 절대 제한 및 EVTX 변환 단계 누적 예산, 1~1800초 |
+| `CAT_ANALYSIS_SPOOL_MEMORY_BYTES` | `8388608` | C2 관련 이벤트 스풀의 메모리 임계값, 64KiB~64MiB |
+| `CAT_ANALYSIS_SPOOL_MAX_BYTES` | `268435456` | C2 관련 이벤트 스풀의 전체 상한, 1MiB~2GiB |
 | `CAT_HTTP_HEADER_TIMEOUT_SECONDS` | `15` | 요청 라인과 헤더의 절대 수신 제한, 1~120초 |
 | `CAT_RESPONSE_WRITE_TIMEOUT_SECONDS` | `60` | 응답 전송 제한, 1~600초 |
 | `CAT_MAX_CONNECTIONS` | `32` | 동시 HTTP 연결/handler 상한, 1~1024 |
@@ -91,7 +104,7 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 $env:LM_STUDIO_URL = "http://192.168.100.1:1234/v1/chat/completions"
 $env:LM_STUDIO_MODEL = "<정확한 /v1/models ID>"
 $env:CAT_LM_TIMEOUT_SECONDS = "900"
-$env:CAT_LM_MAX_TOKENS = "32768"
+$env:CAT_LM_MAX_TOKENS = "8192"
 $env:CAT_LM_TEMPERATURE = "0.7"
 $env:CAT_LM_TOP_P = "0.8"
 $env:CAT_LM_TOP_K = "20"
@@ -111,6 +124,17 @@ $env:CAT_ALLOW_CUSTOM_LM_URL = "true"
 $env:CAT_LM_ALLOWED_ORIGINS = "http://192.168.100.20:1234"
 $env:CAT_LM_API_KEY_ALLOWED_ENDPOINTS = ""
 $env:CAT_LM_STRICT_VALIDATION = "false"
+$env:CAT_LM_HIERARCHICAL_ENABLED = "true"
+$env:CAT_LM_HIERARCHICAL_MIN_EVENTS = "24"
+$env:CAT_LM_HIERARCHICAL_CHUNK_MAX_EVENTS = "24"
+$env:CAT_LM_HIERARCHICAL_CHUNK_MAX_CHARS = "12288"
+$env:CAT_LM_HIERARCHICAL_MAX_CHUNKS = "8"
+$env:CAT_LM_HIERARCHICAL_OVERLAP_EVENTS = "2"
+$env:CAT_LM_HIERARCHICAL_SUMMARY_CHARS = "4096"
+$env:CAT_LM_HIERARCHICAL_CASE_STATE_CHARS = "8192"
+$env:CAT_LM_HIERARCHICAL_CONTEXT_CHARS = "20480"
+$env:CAT_LM_HIERARCHICAL_MAX_TOKENS = "2048"
+$env:CAT_LM_HIERARCHICAL_SOURCE_EVENTS = "10000"
 $env:CAT_BROWSER_ALLOWED_ORIGINS = ""
 $env:CAT_UPLOAD_TIMEOUT_SECONDS = "900"
 $env:CAT_XML_MAX_FILE_BYTES = "134217728"
@@ -134,6 +158,8 @@ $env:CAT_XML_MAX_ELEMENTS_PER_EVENT = "20000"
 $env:CAT_XML_MAX_ELEMENTS_PER_FILE = "5000000"
 $env:CAT_XML_MAX_DEPTH = "128"
 $env:CAT_XML_PARSE_TIMEOUT_SECONDS = "300"
+$env:CAT_ANALYSIS_SPOOL_MEMORY_BYTES = "8388608"
+$env:CAT_ANALYSIS_SPOOL_MAX_BYTES = "268435456"
 $env:CAT_HTTP_HEADER_TIMEOUT_SECONDS = "15"
 $env:CAT_RESPONSE_WRITE_TIMEOUT_SECONDS = "60"
 $env:CAT_MAX_CONNECTIONS = "32"
@@ -195,9 +221,12 @@ CAT 릴리스에는 모델 가중치가 포함되지 않습니다. 독립망 모
 4. finding과 시나리오에 연결된 evidence를 먼저 선택하고, high severity·high confidence·명령줄/IP/프로세스 등 실제 관측값이 풍부한 의심 이벤트를 우선합니다.
 5. 반복되는 낮은 우선순위 Sysmon/timeline 항목은 대표 항목만 남기고, finding·의심 이벤트·시나리오·timeline의 개수 제한과 개별 필드 제한을 적용합니다.
 6. 전체 선별 JSON을 기본 49,152자 예산 안으로 줄이고 `_input_limits` 및 LM 상태 metadata에 원본/포함 개수와 축약 여부를 기록합니다. 전체 범위 이벤트가 대표 근거보다 많아도 축약으로 표시합니다.
-7. `strict=false`이면 `response_format` 없이 근거 기반 한국어 자유 보고서를 요청합니다. 일부 JSON, Markdown, code fence와 일반 텍스트를 모두 허용합니다. 완전한 기존 CAT JSON은 검증 renderer로, 호환 가능한 CAT 부분 구조는 canonical 사실로 보정한 renderer로 처리하며 그 밖의 응답은 원문으로 사용합니다.
-8. `strict=true`이면 기존 `response_format=json_schema`, required section, event/scenario 참조 검증과 고정 Markdown renderer를 사용합니다.
-9. 입력이 축약된 경우 LM 프롬프트, 자유 `report_markdown`의 `CAT 입력 증거 범위`(구조화 보고서는 8번 증거 한계), API metadata와 UI에 전체 이벤트 중 일부 대표 근거만 제공됐음을 명시합니다.
+7. `strict=false`이고 선별 근거가 계층형 기준을 넘으면 시간순 청크별 자유 응답을 만들고, 제한된 누적 사건 상태를 다음 청크에 전달합니다. 마지막 요청은 청크 요약과 CAT의 canonical `intrusion_chain`·`adaptive_time_range`를 함께 사용해 최초 의심 프로세스와 후속 행위를 종합합니다. 실패한 청크는 표시하되 기존 대표 근거를 이용한 최종 요청은 계속합니다.
+8. `strict=false` 최종 요청은 `response_format` 없이 근거 기반 한국어 자유 보고서를 요청합니다. 일부 JSON, Markdown, code fence와 일반 텍스트를 모두 허용합니다. 완전한 기존 CAT JSON은 검증 renderer로, 호환 가능한 CAT 부분 구조는 canonical 사실로 보정한 renderer로 처리하며 그 밖의 응답은 원문으로 사용합니다.
+9. `strict=true`이면 계층형 사전 호출 없이 단 한 번의 `response_format=json_schema` 요청으로 required section, event/scenario 참조 검증과 고정 Markdown renderer를 사용합니다.
+10. 입력이 축약된 경우 LM 프롬프트, 자유 `report_markdown`의 `CAT 입력 증거 범위`(구조화 보고서는 8번 증거 한계), API metadata와 UI에 전체 이벤트 중 일부 대표 근거만 제공됐음을 명시합니다.
+
+계층형 상태 metadata에는 raw prompt 대신 제한된 청크 요약과 집계값만 둡니다. `hierarchical_request_count`는 중간 **논리 호출** 수, `hierarchical_transport_request_count`는 호환 재시도를 포함한 중간 HTTP POST 수입니다. `final_request_count`는 최종 논리 호출 안의 POST 수이고, `lm_logical_request_count`와 `lm_request_count`는 각각 전체 논리 호출 수와 실제 POST 수입니다. 문자 집계는 `hierarchical_request_input_chars`, `hierarchical_transport_input_chars`, `request_input_chars`, `lm_total_request_input_chars`로 구분합니다. 생략·source 상한·반복 축약·실패 수는 `hierarchical_evidence_omitted`, `hierarchical_source_limit_reached`, `hierarchical_repetition_omitted`, `hierarchical_chunks_failed`에서 확인합니다.
 
 EVTX 필드와 명령줄은 공격자가 조작할 수 있는 비신뢰 데이터로 취급하며, 그 안의 지시를 따르지 않도록 system/user 경계를 함께 둡니다. 프롬프트는 제공된 이벤트 근거 밖의 판단을 가설로 표시하도록 요구합니다. Qwen 보고서는 원본 EVTX와 중앙 로그로 재검증해야 합니다.
 
@@ -381,7 +410,7 @@ strict 검증된 `report_markdown`은 다음 9개 섹션을 항상 같은 순서
 
 LLM 입력은 `CAT_LM_MAX_INPUT_CHARS`와 `CAT_LM_MAX_FIELD_CHARS`를 적용하므로 전체 API `analysis`보다 적을 수 있습니다. 실제 포함·원본 개수와 잘림 여부는 `llm.input_*`, `llm.input_source_*` metadata와 입력의 `_input_limits`에 남습니다. 이 축소는 UI에 반환되는 원본 구조화 분석을 변경하지 않습니다. 128k context를 승인해도 기본 49,152자 예산은 그대로 안전 여유로 사용할 수 있으며, 값을 늘릴 때는 모델 context와 최대 출력 token을 함께 검토해야 합니다.
 
-LM timeout은 기본 900초이고 환경변수로 최대 7200초까지 조정할 수 있습니다. timeout 로그에는 안전하게 정규화된 endpoint, 모델 ID, 요청 메시지 문자 수와 경과시간만 기록하며 prompt, 원본 증거, HTTP 오류 body와 API key는 기록하지 않습니다.
+LM timeout은 기본 900초이고 환경변수로 최대 7200초까지 조정할 수 있습니다. 이 제한은 각 중간 청크와 최종 요청의 **논리 호출마다 독립적으로** 적용되며, 선택 파라미터 호환 재시도는 최초 요청과 같은 절대 deadline을 공유합니다(`llm.timeout_scope=per_logical_lm_call_including_compatibility_retry`). 따라서 계층형 분석의 전체 소요시간은 최악의 경우 `(중간 청크 수 + 최종 1회) × timeout`에 가까워질 수 있고, CAT 자체에는 이 전체 파이프라인을 다시 감싸는 별도 총 LM deadline이 없습니다. timeout 로그에는 안전하게 정규화된 endpoint, 모델 ID, 요청 메시지 문자 수와 경과시간만 기록하며 prompt, 원본 증거, HTTP 오류 body와 API key는 기록하지 않습니다.
 
 ## 독립망 보안 기본값
 

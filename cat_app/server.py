@@ -21,6 +21,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import __version__
+from .adaptive_range import (
+    DEFAULT_AUTO_EXPAND_EDGE_SECONDS,
+    DEFAULT_AUTO_EXPAND_WINDOW_SECONDS,
+    recommend_expanded_range,
+)
 from .analyzer import analyze_events
 from .evtx_reader import XML_PARSE_TIMEOUT_SECONDS, parse_event_files
 from .reporting import (
@@ -43,7 +48,7 @@ from .reporting import (
     generate_rule_report,
     normalize_chat_endpoint,
 )
-from .timeutil import get_timezone, parse_user_datetime
+from .timeutil import get_timezone, isoformat_utc, parse_user_datetime
 
 
 def _env_bounded_float(
@@ -170,6 +175,10 @@ CODEX_DEV_ENABLED = os.getenv("CAT_ENABLE_CODEX_DEV", "").strip().lower() in {
     "yes",
     "on",
 }
+DEFAULT_AUTO_EXPAND_TIME_RANGE = os.getenv(
+    "CAT_AUTO_EXPAND_TIME_RANGE",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 ANALYSIS_LOCK = threading.Lock()
 UPLOAD_LOCK = threading.Lock()
 LARGE_RESPONSE_SLOTS = threading.BoundedSemaphore(DEFAULT_MAX_LARGE_RESPONSES)
@@ -285,6 +294,11 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "upload_timeout_seconds": DEFAULT_UPLOAD_TIMEOUT_SECONDS,
                     "xml_parse_timeout_seconds": XML_PARSE_TIMEOUT_SECONDS,
+                    "adaptive_time_range": {
+                        "default_enabled": DEFAULT_AUTO_EXPAND_TIME_RANGE,
+                        "edge_seconds": DEFAULT_AUTO_EXPAND_EDGE_SECONDS,
+                        "window_seconds": DEFAULT_AUTO_EXPAND_WINDOW_SECONDS,
+                    },
                     "http_header_timeout_seconds": DEFAULT_HTTP_HEADER_TIMEOUT_SECONDS,
                     "response_write_timeout_seconds": DEFAULT_RESPONSE_WRITE_TIMEOUT_SECONDS,
                     "max_connections": DEFAULT_MAX_CONNECTIONS,
@@ -327,6 +341,7 @@ class CATRequestHandler(BaseHTTPRequestHandler):
         large_response_slot_acquired = False
         upload_temp: tempfile.TemporaryDirectory[str] | None = None
         temp_dir_path: Path | None = None
+        parse_result = None
         try:
             _stage_log(request_id, request_start, "request_start")
             if not LARGE_RESPONSE_SLOTS.acquire(blocking=False):
@@ -389,6 +404,10 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 return
 
             max_records = _bounded_int(fields.get("max_records"), default=20000, minimum=100, maximum=200000)
+            auto_expand_time_range = _form_bool(
+                fields.get("auto_expand_time_range"),
+                default=DEFAULT_AUTO_EXPAND_TIME_RANGE,
+            )
             agent_backend = _agent_backend(fields)
             use_llm = agent_backend == "lmstudio"
             lm_url = _resolve_lm_url(fields) if use_llm else None
@@ -432,6 +451,82 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 return
 
             analysis = analyze_events(parse_result, start_utc, end_utc)
+            range_decision = recommend_expanded_range(
+                analysis,
+                parse_result,
+                start_utc,
+                end_utc,
+                enabled=auto_expand_time_range,
+            )
+            adaptive_range_metadata = range_decision.metadata(
+                enabled=auto_expand_time_range,
+                requested_start_utc=start_utc,
+                requested_end_utc=end_utc,
+                parse_result=parse_result,
+            )
+            adaptive_range_metadata["applied"] = False
+            if range_decision.expanded:
+                initial_analysis = analysis
+                initial_parser = parse_result.to_dict()
+                adaptive_range_metadata["initial_parser"] = initial_parser
+                parse_result.close()
+                parse_result = None
+                try:
+                    parse_result = parse_event_files(
+                        saved_paths,
+                        range_decision.start_utc,
+                        range_decision.end_utc,
+                        max_records,
+                    )
+                    if parse_result.records or not parse_result.errors:
+                        analysis = analyze_events(
+                            parse_result,
+                            range_decision.start_utc,
+                            range_decision.end_utc,
+                        )
+                        adaptive_range_metadata["applied"] = True
+                    else:
+                        adaptive_range_metadata["expansion_error"] = (
+                            "확장 범위에서 분석 가능한 이벤트를 읽지 못해 최초 선택 범위 결과를 유지했습니다."
+                        )
+                        parse_result.close()
+                        parse_result = None
+                        analysis = initial_analysis
+                except Exception as exc:
+                    if parse_result is not None:
+                        parse_result.close()
+                        parse_result = None
+                    analysis = initial_analysis
+                    adaptive_range_metadata["expansion_error"] = (
+                        "확장 범위 재분석 중 오류가 발생해 최초 선택 범위 결과를 유지했습니다."
+                    )
+                    _stage_log(
+                        request_id,
+                        request_start,
+                        "adaptive_range_error",
+                        error_type=type(exc).__name__,
+                    )
+                if adaptive_range_metadata["applied"]:
+                    _stage_log(
+                        request_id,
+                        request_start,
+                        "adaptive_range",
+                        expanded=True,
+                        start=isoformat_utc(range_decision.start_utc),
+                        end=isoformat_utc(range_decision.end_utc),
+                        records_loaded=len(parse_result.records) if parse_result else 0,
+                    )
+            analysis["adaptive_time_range"] = adaptive_range_metadata
+            scope = analysis.get("scope")
+            if isinstance(scope, dict):
+                scope["requested_start_utc"] = isoformat_utc(start_utc)
+                scope["requested_end_utc"] = isoformat_utc(end_utc)
+            # The disk-backed network spool is no longer needed after the two
+            # analysis passes. Release its descriptor before LM inference or
+            # a slow response write, both of which may take several minutes.
+            if parse_result is not None:
+                parse_result.close()
+                parse_result = None
             checkpoint = _mark_stage(
                 request_id,
                 request_start,
@@ -516,6 +611,8 @@ class CATRequestHandler(BaseHTTPRequestHandler):
             _stage_log(request_id, request_start, "server_error", error=f"{type(exc).__name__}: {exc}")
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"{type(exc).__name__}: {exc}")
         finally:
+            if parse_result is not None:
+                parse_result.close()
             if upload_temp is not None and temp_dir_path is not None:
                 _cleanup_temp_context(
                     request_id,
@@ -978,6 +1075,17 @@ def _bounded_int(value: str | None, default: int, minimum: int, maximum: int) ->
     if number > maximum:
         return maximum
     return number
+
+
+def _form_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError("boolean form field가 올바르지 않습니다.")
 
 
 def _mark_stage(

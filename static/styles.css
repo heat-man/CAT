@@ -297,6 +297,17 @@ select:focus {
   font-size: 14px;
 }
 
+.analysis-option {
+  margin-top: 14px;
+}
+
+.field-note {
+  margin: 6px 0 0 26px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .tabs {
   height: 56px;
   display: flex;
@@ -325,10 +336,130 @@ select:focus {
   font-weight: 650;
 }
 
+.result-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
 .tabs .secondary {
   flex: 0 0 auto;
-  margin-left: auto;
+  margin-left: 0;
   white-space: nowrap;
+}
+
+.history-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: min(82vh, 820px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 18px 54px rgba(23, 32, 27, 0.3);
+}
+
+.history-dialog::backdrop {
+  background: rgba(23, 32, 27, 0.48);
+}
+
+.history-dialog-header,
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.history-dialog-header p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-toolbar {
+  padding-block: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  background: #fbfcfb;
+}
+
+.history-list {
+  display: grid;
+  gap: 12px;
+  max-height: calc(min(82vh, 820px) - 146px);
+  padding: 14px 18px 20px;
+  overflow-y: auto;
+}
+
+.history-item {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.history-item-heading,
+.history-item-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.history-item h3 {
+  margin: 0 0 3px;
+  font-size: 15px;
+}
+
+.history-item time,
+.history-item p {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-item p {
+  margin: 9px 0;
+}
+
+.history-item-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.history-limit {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #fff3d6;
+  color: #765713;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.danger-button {
+  border-color: rgba(184, 74, 49, 0.35);
+  color: var(--warn);
+}
+
+.history-empty {
+  margin: 30px 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.intrusion-chain {
+  margin-bottom: 24px;
+}
+
+.intrusion-chain-table td:nth-child(5),
+.intrusion-chain-table td:nth-child(6) {
+  min-width: 180px;
 }
 
 .loading {
@@ -418,7 +549,8 @@ select:focus {
 
 .markdown-view h1,
 .markdown-view h2,
-.markdown-view h3 {
+.markdown-view h3,
+.markdown-view h4 {
   letter-spacing: 0;
 }
 
@@ -435,6 +567,15 @@ select:focus {
 .markdown-view h3 {
   margin: 18px 0 8px;
   font-size: 15px;
+}
+
+.markdown-view h4 {
+  margin: 14px 0 6px;
+  font-size: 14px;
+}
+
+.print-only {
+  display: none;
 }
 
 .markdown-view p,
@@ -567,6 +708,22 @@ select:focus {
   font-size: 13px;
 }
 
+.lm-hierarchical-status {
+  margin: 10px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid #9bbdb5;
+  border-radius: 8px;
+  background: #eff8f5;
+  color: #245447;
+  font-size: 13px;
+}
+
+.lm-hierarchical-status.has-warning {
+  border-color: #d7a84b;
+  background: #fff8e7;
+  color: #5d4512;
+}
+
 .llm-warning ul,
 .parser-warning ul {
   margin: 6px 0 0;
@@ -639,6 +796,16 @@ select:focus {
     margin-left: 0;
   }
 
+  .result-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .result-actions .secondary {
+    width: auto;
+    flex: 1 1 0;
+  }
+
   .loading {
     grid-template-columns: 1fr;
     align-items: start;
@@ -685,6 +852,7 @@ select:focus {
   .tabs,
   .loading,
   .error-box,
+  .history-dialog,
   #findingsView,
   #summaryView {
     display: none !important;
@@ -711,6 +879,23 @@ select:focus {
 
   #reportView .empty-state {
     display: none !important;
+  }
+
+  #reportView .print-only {
+    display: block !important;
+  }
+
+  #reportView .print-analysis-appendix,
+  #reportView .print-network-appendix {
+    margin-top: 12mm;
+    padding-top: 8mm;
+    border-top: 2px solid #000;
+    break-before: page;
+    page-break-before: always;
+  }
+
+  #reportView .print-network-appendix {
+    border-top-style: double;
   }
 
   #reportView h1,
@@ -742,8 +927,13 @@ select:focus {
     page-break-inside: auto;
   }
 
+  #reportView details:not([open]) > table {
+    display: table !important;
+  }
+
   #reportView tr,
   #reportView .llm-warning,
+  #reportView .lm-hierarchical-status,
   #reportView .parser-warning {
     break-inside: avoid;
     page-break-inside: avoid;

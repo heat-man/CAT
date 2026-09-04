@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import logging
 from math import isfinite
 import os
 from pathlib import Path
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import xml.parsers.expat as expat
@@ -108,6 +110,18 @@ MAX_XML_ELEMENTS_PER_FILE = _env_int(
     "CAT_XML_MAX_ELEMENTS_PER_FILE", 5_000_000, minimum=1000, maximum=20_000_000
 )
 MAX_XML_DEPTH = _env_int("CAT_XML_MAX_DEPTH", 128, minimum=16, maximum=1024)
+ANALYSIS_SPOOL_MEMORY_BYTES = _env_int(
+    "CAT_ANALYSIS_SPOOL_MEMORY_BYTES",
+    8 * 1024 * 1024,
+    minimum=64 * 1024,
+    maximum=64 * 1024 * 1024,
+)
+ANALYSIS_SPOOL_MAX_BYTES = _env_int(
+    "CAT_ANALYSIS_SPOOL_MAX_BYTES",
+    256 * 1024 * 1024,
+    minimum=1024 * 1024,
+    maximum=2 * 1024 * 1024 * 1024,
+)
 DEFAULT_XML_PARSE_TIMEOUT_SECONDS = 300.0
 MAX_XML_PARSE_TIMEOUT_SECONDS = 1800.0
 
@@ -126,6 +140,10 @@ XML_PARSE_TIMEOUT_SECONDS = _xml_parse_timeout_seconds()
 
 class XMLLimitError(ValueError):
     pass
+
+
+class RetentionLimitError(XMLLimitError):
+    """The in-memory analysis sample is full; file scanning may continue."""
 
 
 class XMLParseTimeoutError(TimeoutError):
@@ -192,13 +210,13 @@ class _RetentionBudget:
 
         next_fields = self.fields + field_count
         if next_fields > MAX_XML_RETAINED_FIELDS_PER_ANALYSIS:
-            raise XMLLimitError(
+            raise RetentionLimitError(
                 "XML retained field count exceeds "
                 f"{MAX_XML_RETAINED_FIELDS_PER_ANALYSIS} per analysis"
             )
         next_chars = self.chars + char_count
         if next_chars > MAX_XML_RETAINED_CHARS_PER_ANALYSIS:
-            raise XMLLimitError(
+            raise RetentionLimitError(
                 "XML retained records exceed "
                 f"{MAX_XML_RETAINED_CHARS_PER_ANALYSIS} characters per analysis"
             )
@@ -466,15 +484,33 @@ def parse_event_files(
     total_seen = 0
     total_in_range = 0
     truncated = False
-    stop_after_limit = False
+    record_limit_reached = False
+    retention_exhausted = False
+    network_records_seen = 0
+    network_records_spooled = 0
+    network_spool_bytes = 0
+    network_spool_limit_reached = False
+    network_scan_complete = True
+    earliest_event_time: datetime | None = None
+    latest_event_time: datetime | None = None
+    events_before_range = 0
+    events_after_range = 0
     parse_started_at = time.monotonic()
     parse_deadline = parse_started_at + XML_PARSE_TIMEOUT_SECONDS
     retention_budget = _RetentionBudget()
+    network_record_spool = tempfile.SpooledTemporaryFile(
+        max_size=ANALYSIS_SPOOL_MEMORY_BYTES,
+        mode="w+t",
+        encoding="utf-8",
+        newline="\n",
+    )
 
     for path in paths:
         before_seen = total_seen
         before_range = total_in_range
         before_records = len(records)
+        before_network_seen = network_records_seen
+        before_network_spooled = network_records_spooled
         file_error: str | None = None
         try:
             iterator = (
@@ -484,18 +520,71 @@ def parse_event_files(
             )
             for record in iterator:
                 total_seen += 1
+                if record.time_created is not None:
+                    if (
+                        earliest_event_time is None
+                        or record.time_created < earliest_event_time
+                    ):
+                        earliest_event_time = record.time_created
+                    if (
+                        latest_event_time is None
+                        or record.time_created > latest_event_time
+                    ):
+                        latest_event_time = record.time_created
+                    if start_utc is not None and record.time_created < start_utc:
+                        events_before_range += 1
+                    elif end_utc is not None and record.time_created > end_utc:
+                        events_after_range += 1
                 if _in_range(record.time_created, start_utc, end_utc):
                     total_in_range += 1
-                    if len(records) < max_records:
-                        retention_budget.reserve(record)
-                        records.append(record)
-                    else:
+                    if _is_endpoint_network_analysis_event(record):
+                        network_records_seen += 1
+                        if not network_spool_limit_reached:
+                            serialized = (
+                                json.dumps(
+                                    record.to_dict(),
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                + "\n"
+                            )
+                            serialized_bytes = len(serialized.encode("utf-8"))
+                            if (
+                                network_spool_bytes + serialized_bytes
+                                <= ANALYSIS_SPOOL_MAX_BYTES
+                            ):
+                                network_record_spool.write(serialized)
+                                network_spool_bytes += serialized_bytes
+                                network_records_spooled += 1
+                            else:
+                                LOGGER.warning(
+                                    "Endpoint analysis spool limit reached "
+                                    "max_bytes=%d records_seen=%d "
+                                    "records_spooled=%d spool_bytes=%d",
+                                    ANALYSIS_SPOOL_MAX_BYTES,
+                                    network_records_seen,
+                                    network_records_spooled,
+                                    network_spool_bytes,
+                                )
+                                network_spool_limit_reached = True
+                                network_scan_complete = False
+                                truncated = True
+                    if len(records) >= max_records or retention_exhausted:
                         truncated = True
-                        stop_after_limit = True
-                        break
+                        record_limit_reached = True
+                        continue
+                    try:
+                        retention_budget.reserve(record)
+                    except RetentionLimitError:
+                        retention_exhausted = True
+                        truncated = True
+                        record_limit_reached = True
+                        continue
+                    records.append(record)
         except EvtxDependencyError as exc:
             file_error = str(exc)
             errors.append(f"{path.name}: {exc}")
+            network_scan_complete = False
         except TimeoutError as exc:
             elapsed_seconds = getattr(exc, "elapsed_seconds", None)
             if elapsed_seconds is None:
@@ -535,6 +624,7 @@ def parse_event_files(
                 elapsed_seconds,
             )
             truncated = True
+            network_scan_complete = False
         except Exception as exc:
             file_error = f"{type(exc).__name__}: {exc}"
             errors.append(f"{path.name}: {file_error}")
@@ -543,17 +633,25 @@ def parse_event_files(
             # malformed tail. Reports surface parser errors alongside this
             # truncation flag instead of silently presenting a complete scope.
             truncated = True
+            network_scan_complete = False
 
         files.append(
             {
                 "name": path.name,
                 "events_seen": total_seen - before_seen,
                 "events_in_range": total_in_range - before_range,
+                "records_retained": len(records) - before_records,
+                "network_records_seen": network_records_seen - before_network_seen,
+                "network_records_spooled": (
+                    network_records_spooled - before_network_spooled
+                ),
+                "scan_complete": file_error is None,
                 "error": file_error,
             }
         )
-        if stop_after_limit:
-            break
+
+    network_record_spool.flush()
+    network_record_spool.seek(0)
 
     return ParseResult(
         records=records,
@@ -562,7 +660,36 @@ def parse_event_files(
         total_seen=total_seen,
         total_in_range=total_in_range,
         truncated=truncated,
+        record_limit_reached=record_limit_reached,
+        retention_limit_reached=retention_exhausted,
+        network_records_seen=network_records_seen,
+        network_records_spooled=network_records_spooled,
+        network_spool_bytes=network_spool_bytes,
+        network_spool_limit_reached=network_spool_limit_reached,
+        network_scan_complete=network_scan_complete,
+        earliest_event_time=earliest_event_time,
+        latest_event_time=latest_event_time,
+        events_before_range=events_before_range,
+        events_after_range=events_after_range,
+        _network_record_spool=network_record_spool,
     )
+
+
+def _is_endpoint_network_analysis_event(record: EventRecord) -> bool:
+    event_id = str(record.event_id or "")
+    provider = (record.provider or "").strip().casefold()
+    channel = (record.channel or "").strip().casefold()
+    if (
+        provider == "microsoft-windows-sysmon"
+        and channel == "microsoft-windows-sysmon/operational"
+    ):
+        return event_id in {"1", "3", "5", "22"}
+    if (
+        provider == "microsoft-windows-security-auditing"
+        and channel == "security"
+    ):
+        return event_id in {"4688", "4689", "5156"}
+    return False
 
 
 def _parse_evtx_file(path: Path, deadline: float | None = None):
