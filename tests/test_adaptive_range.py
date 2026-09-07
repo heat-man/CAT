@@ -93,6 +93,32 @@ def _run_server_analysis(
 
 
 class AdaptiveRangeTests(unittest.TestCase):
+    def test_observed_upstream_source_at_edge_recovers_earlier_context(self) -> None:
+        analysis = {
+            "suspicious_events": [{"time": "2026-09-01T11:30:00Z"}],
+            "intrusion_chain": {
+                "origin_process": {
+                    "start_time": "2026-09-01T10:02:00Z",
+                    "creation_event_observed": True,
+                },
+            },
+        }
+        decision = recommend_expanded_range(
+            analysis, _parse_result(before=10), _utc(10), _utc(12), enabled=True,
+        )
+        self.assertEqual(decision.start_utc, _utc(9))
+        self.assertEqual(decision.end_utc, _utc(12))
+
+    def test_unobserved_origin_hint_does_not_expand_range(self) -> None:
+        analysis = {"intrusion_chain": {
+            "origin_process": {"start_time": "2026-09-01T10:02:00Z", "creation_event_observed": False},
+            "origin_assessment": {"recommended_lookback_before": "2026-09-01T10:00:00Z"},
+        }}
+        decision = recommend_expanded_range(
+            analysis, _parse_result(before=10), _utc(10), _utc(12), enabled=True,
+        )
+        self.assertFalse(decision.expanded)
+
     def test_expands_both_edges_for_boundary_evidence_and_clamps_to_input(self) -> None:
         analysis = {
             "suspicious_events": [

@@ -683,12 +683,17 @@ def _is_endpoint_network_analysis_event(record: EventRecord) -> bool:
         provider == "microsoft-windows-sysmon"
         and channel == "microsoft-windows-sysmon/operational"
     ):
-        return event_id in {"1", "3", "5", "22"}
+        return event_id in {"1", "3", "5", "11", "22"}
     if (
         provider == "microsoft-windows-security-auditing"
         and channel == "security"
     ):
         return event_id in {"4688", "4689", "5156"}
+    if (
+        provider == "microsoft-windows-powershell"
+        and channel == "microsoft-windows-powershell/operational"
+    ):
+        return event_id in {"4103", "4104"}
     return False
 
 
@@ -865,6 +870,7 @@ def _parse_event_element(
     task = None
     opcode = None
     keywords = None
+    execution_process_id = None
 
     if system is not None:
         provider_node = _first_child(system, "Provider")
@@ -881,6 +887,11 @@ def _parse_event_element(
         time_node = _first_child(system, "TimeCreated")
         if time_node is not None:
             time_created = parse_event_time(time_node.attrib.get("SystemTime"))
+        execution_node = _first_child(system, "Execution")
+        if execution_node is not None:
+            # This is the logging process, not universally the event's actor.
+            # Only provider-specific correlation may use it as an actor PID.
+            execution_process_id = execution_node.attrib.get("ProcessID")
 
     _check_xml_deadline(deadline)
     return EventRecord(
@@ -898,6 +909,7 @@ def _parse_event_element(
         event_data=event_data,
         user_data=user_data,
         raw_xml=raw_xml,
+        execution_process_id=execution_process_id,
     )
 
 

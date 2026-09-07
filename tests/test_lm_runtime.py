@@ -1795,7 +1795,8 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                 self.assertTrue(status["used"], status["error"])
                 self.assertTrue(status["unstructured_report_used"])
                 self.assertFalse(status["structured_report_recovered"])
-                self.assertEqual(report, content)
+                self.assertEqual(report.split("\n\n## CAT 시간순 증거 부록", 1)[0], content)
+                self.assertIn("EVT-0002", report)
 
     def test_relaxed_mode_keeps_substantive_later_duplicates(self) -> None:
         structured = _structured_payload(
@@ -2187,10 +2188,11 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
                 model=self.model_id,
             )
 
-        self.assertEqual(
-            report,
-            "# 최종 침해 보고서\n\nroot.exe부터 시작된 실행 연쇄를 확인했습니다.",
-        )
+        self.assertTrue(report.startswith(
+            "# 최종 침해 보고서\n\nroot.exe부터 시작된 실행 연쇄를 확인했습니다."
+        ))
+        self.assertIn("CAT 시간순 증거 부록", report)
+        self.assertEqual(status["report_evidence_count"], 6)
         self.assertTrue(status["used"], status["error"])
         self.assertTrue(status["hierarchical_analysis_used"])
         self.assertEqual(status["hierarchical_chunk_count"], 3)
@@ -2254,6 +2256,7 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         analysis = _hierarchical_analysis_fixture(6)
         completions = [
             _completion_with_content("   "),
+            _completion_with_content("   "),
             _completion_with_content("- 두 번째 시간창 누적 상태"),
             _completion_with_content("- 세 번째 시간창 누적 상태"),
             _completion_with_content("부분 청크 실패를 고려한 최종 보고서"),
@@ -2281,9 +2284,14 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
             )
 
         self.assertTrue(status["used"], status["error"])
-        self.assertEqual(open_request.call_count, 4)
+        self.assertEqual(open_request.call_count, 5)
         self.assertEqual(status["hierarchical_chunks_completed"], 2)
         self.assertEqual(status["hierarchical_chunks_failed"], 1)
+        self.assertEqual(status["hierarchical_chunks_recovered"], 1)
+        self.assertEqual(status["hierarchical_chunks"][0]["status"], "recovered")
+        self.assertIn("root.exe", status["hierarchical_chunks"][0]["summary"])
+        second_chunk_prompt = json.loads(open_request.call_args_list[2].args[0].data)
+        self.assertIn("CAT 대체 요약", second_chunk_prompt["messages"][1]["content"])
         self.assertTrue(status["input_truncated"])
         self.assertIn("시간 청크 1", " ".join(status["validation_warnings"]))
         self.assertIn("계층형 LM 시간 청크 1개", status["input_limitation"])
@@ -2339,6 +2347,180 @@ class RelaxedLMRuntimeTests(unittest.TestCase):
         self.assertEqual(status["lm_request_count"], 4)
         self.assertGreater(status["lm_total_request_input_chars"], 0)
         self.assertIn("CAT 규칙 기반 침해 로그 분석 보고서", report)
+        self.assertIn("보존된 시간 청크 분석", report)
+        self.assertIn("시간 청크 1 누적 상태", report)
+        self.assertIn("시간 청크 3 누적 상태", report)
+        self.assertTrue(status["report_fallback_used"])
+        self.assertEqual(status["chunk_summaries_preserved"], 3)
+
+    def test_empty_chunk_retry_recovers_without_increasing_token_budget(self) -> None:
+        analysis = _hierarchical_analysis_fixture(4)
+        completions = [
+            _completion_with_content(""),
+            _completion_with_content("- 재시도된 청크: root.exe 실행 관측"),
+            _completion_with_content("- 다음 청크: 후속 연결 관측"),
+            _completion_with_content("# 최종 보고서"),
+        ]
+        with (
+            mock.patch.multiple(reporting, DEFAULT_LM_HIERARCHICAL_ENABLED=True,
+                DEFAULT_LM_HIERARCHICAL_MIN_EVENTS=2,
+                DEFAULT_LM_HIERARCHICAL_CHUNK_MAX_EVENTS=2,
+                DEFAULT_LM_HIERARCHICAL_OVERLAP_EVENTS=0,
+                DEFAULT_LM_ENABLE_THINKING=True,
+                DEFAULT_LM_REASONING_EFFORT="medium"),
+            mock.patch.object(reporting, "open_lm_request",
+                side_effect=[_FakeResponse(item) for item in completions]) as open_request,
+        ):
+            report, status = reporting.generate_report(analysis, use_llm=True,
+                lm_url=self.base_url, model=self.model_id)
+
+        payloads = [json.loads(call.args[0].data) for call in open_request.call_args_list]
+        self.assertEqual(len(payloads), 4)
+        self.assertTrue(status["used"])
+        self.assertTrue(status["hierarchical_chunks"][0]["empty_response_retried"])
+        self.assertEqual(status["hierarchical_chunks_failed"], 0)
+        self.assertEqual(status["hierarchical_chunks_recovered"], 0)
+        self.assertEqual(status["lm_request_count"], 4)
+        self.assertEqual(payloads[0]["max_tokens"], payloads[1]["max_tokens"])
+        self.assertFalse(payloads[1]["chat_template_kwargs"]["enable_thinking"])
+        self.assertNotIn("reasoning_effort", payloads[1])
+        self.assertIn("재시도된 청크", payloads[2]["messages"][1]["content"])
+        self.assertIn("EVT-0004", report)
+
+    def test_all_empty_chunks_and_final_keep_evidence_and_recovery_notes(self) -> None:
+        analysis = _hierarchical_analysis_fixture(4)
+        with (
+            mock.patch.multiple(reporting, DEFAULT_LM_HIERARCHICAL_ENABLED=True,
+                DEFAULT_LM_HIERARCHICAL_MIN_EVENTS=2,
+                DEFAULT_LM_HIERARCHICAL_CHUNK_MAX_EVENTS=2,
+                DEFAULT_LM_HIERARCHICAL_OVERLAP_EVENTS=0),
+            mock.patch.object(reporting, "open_lm_request", side_effect=[
+                _FakeResponse(_completion_with_content("")) for _ in range(5)
+            ]) as open_request,
+        ):
+            report, status = reporting.generate_report(analysis, use_llm=True,
+                lm_url=self.base_url, model=self.model_id)
+
+        self.assertFalse(status["used"])
+        self.assertTrue(status["report_fallback_used"])
+        self.assertEqual(status["hierarchical_chunks_recovered"], 2)
+        self.assertEqual(status["hierarchical_chunks_completed"], 0)
+        self.assertEqual(status["lm_request_count"], 5)
+        self.assertEqual(open_request.call_count, 5)
+        self.assertEqual(status["chunk_summaries_preserved"], 2)
+        self.assertTrue(status["report_evidence_appended"])
+        self.assertIn("보존된 시간 청크 분석", report)
+        self.assertIn("CAT 대체 요약", report)
+        for event in analysis["suspicious_events"]:
+            self.assertIn(event["event_ref"], report)
+
+    def test_empty_chunk_retry_shares_original_deadline(self) -> None:
+        with (
+            mock.patch.object(reporting, "perf_counter", side_effect=[0.0, 0.0, 0.9, 0.9]),
+            mock.patch.object(reporting, "_perform_lm_chat_request", return_value=(
+                _completion_with_content(""), {"request_count": 1}
+            )) as request,
+        ):
+            with self.assertRaises(reporting._LMEmptyReportError) as caught:
+                reporting._request_hierarchical_completion(
+                    [{"role": "user", "content": "local evidence"}], self.base_url,
+                    self.model_id, timeout_seconds=1.0,
+                    forward_api_key_to_custom_url=None,
+                )
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(caught.exception._cat_lm_request_count, 1)
+
+    def test_retained_report_evidence_survives_lm_selection_and_shows_decoding(self) -> None:
+        analysis = _analysis()
+        evidence = []
+        for index in range(140):
+            evidence.append({
+                "event_ref": f"RPT-{index + 1:05d}",
+                "source_file": "endpoint.evtx", "record_id": index + 1,
+                "time": f"2026-09-01T00:{index // 60:02d}:{index % 60:02d}Z",
+                "event_id": 1, "provider": "Microsoft-Windows-Sysmon",
+                "host": "endpoint", "process": f"p{index}.exe",
+                "command_line": f"p{index}.exe --stage {index}", "severity": "high",
+            })
+        evidence[-1]["decoded_powershell"] = {
+            "status": "decoded", "decoded_scripts": [{"source": "EncodedCommand",
+                "method": "base64", "encoding": "utf-16-le", "depth": 1,
+                "text": "Write-Output 'retained-decoded-evidence'\n# ``` retained literal\nWrite-Output `\n  'second line'"}],
+            "signals": [], "warnings": ["정적 분석만 수행"], "truncated": False,
+        }
+        evidence[-1]["fields"] = {"TargetObject": "HKCU\\Software\\Example\\Run",
+            "Details": "review-only payload path", "ParentImage": "C:\\example\\loader.exe"}
+        analysis["report_evidence"] = list(reversed(evidence))
+        analysis["suspicious_events"] = evidence[:2]
+        analysis["report_evidence_scope"] = {"included_event_count": 140,
+            "truncated": True, "omitted_event_references": 17,
+            "limitations": ["검증용 수집 상한에 도달했습니다."]}
+        with (
+            mock.patch.object(reporting, "DEFAULT_LM_HIERARCHICAL_ENABLED", False),
+            mock.patch.object(reporting, "open_lm_request",
+                return_value=_FakeResponse(_completion_with_content("짧은 LM 보고서"))) as request,
+        ):
+            report, status = reporting.generate_report(analysis, use_llm=True,
+                lm_url=self.base_url, model=self.model_id)
+
+        self.assertTrue(report.startswith("짧은 LM 보고서"))
+        self.assertEqual(status["report_evidence_count"], 140)
+        self.assertIn("retained-decoded-evidence", report)
+        script = evidence[-1]["decoded_powershell"]["decoded_scripts"][0]["text"]
+        self.assertIn("````powershell\n" + script + "\n````", report)
+        self.assertIn("TargetObject: HKCU\\Software\\Example\\Run", report)
+        self.assertIn("ParentImage: C:\\example\\loader.exe", report)
+        self.assertIn("인코딩만으로 악성으로 판정하지 않습니다", report)
+        self.assertIn("검증용 수집 상한", report)
+        self.assertIn("제외된 매칭 참조: 17건", report)
+        for event in evidence:
+            self.assertIn(f"record={event['record_id']} /", report)
+            self.assertIn(event["event_ref"], report)
+        self.assertLess(report.index("RPT-00001"), report.index("RPT-00140"))
+        payload = json.loads(request.call_args.args[0].data)
+        prompt = payload["messages"][1]["content"]
+        self.assertNotIn("RPT-00140", prompt)
+        self.assertIn("report_evidence_scope", prompt)
+        self.assertLessEqual(sum(len(message["content"]) for message in payload["messages"]),
+            reporting.DEFAULT_LM_MAX_INPUT_CHARS)
+        rule_report, rule_status = reporting.generate_rule_report(analysis)
+        self.assertIn("RPT-00140", rule_report)
+        self.assertEqual(rule_status["report_evidence_count"], 140)
+
+    def test_report_merges_source_context_but_preserves_distinct_record_times(self) -> None:
+        analysis = _analysis()
+        event = {"source_file": "test.evtx", "record_id": "1", "event_ref": "RPT-00001",
+            "time": "2026-09-01T00:00:00Z", "event_id": "1", "host": "HOST",
+            "provider": "Microsoft-Windows-Sysmon", "process": "loader.exe", "severity": "high"}
+        second = {**event, "time": "2026-09-01T00:01:00Z", "event_ref": "RPT-00002"}
+        unknown_one = {**event, "record_id": None, "event_ref": "RPT-00003"}
+        unknown_two = {**unknown_one, "event_ref": "RPT-00004"}
+        analysis["report_evidence"] = [event, second, unknown_one, unknown_two]
+        analysis["intrusion_chain"] = {"steps": [{"source_refs": ["test.evtx#1"],
+            "time": event["time"], "event_id": "1", "host": "HOST", "process": "loader.exe",
+            "event_count": 1, "relationship_basis": "observed parent GUID"}]}
+        analysis["timeline"] = [{"time": event["time"], "event_id": "1", "host": "HOST",
+            "process": "loader.exe", "severity": "high", "title": "representative view"}]
+        report, metadata = reporting._append_report_evidence("narrative", analysis)
+        self.assertEqual(metadata["report_evidence_count"], 4)
+        self.assertEqual(report.count("- 원본 참조:"), 4)
+        self.assertIn("observed parent GUID", report)
+        for reference in ("RPT-00001", "RPT-00002", "RPT-00003", "RPT-00004"):
+            self.assertIn(reference, report)
+
+    def test_tiny_chunk_budget_keeps_decoded_behavior_not_only_encoded_command(self) -> None:
+        event = {"event_ref": "RPT-00001", "time": "2026-09-01T00:00:00Z", "event_id": 1,
+            "process": "powershell.exe", "command_line": "powershell.exe -EncodedCommand " + "A" * 8192,
+            "decoded_powershell": {"status": "decoded", "decoded_scripts": [{
+                "text": "Write-Output 'static-decoded-text'\n" * 100,
+                "source": "CommandLine", "encoding": "utf-16-le"}],
+                "signals": [{"id": f"signal-{index}", "description": "detail" * 80} for index in range(8)]}}
+        with mock.patch.object(reporting, "DEFAULT_LM_MAX_INPUT_CHARS", 8192):
+            item = reporting._hierarchical_evidence_item(event, source_kind="report_evidence")
+        self.assertIn("decoded_powershell", item)
+        self.assertIn("static-decoded-text", json.dumps(item["decoded_powershell"]))
+        self.assertTrue(item["decoded_powershell"]["truncated"])
+        self.assertLessEqual(len(json.dumps(item, ensure_ascii=False, separators=(",", ":"))), 2048)
 
     def test_hierarchical_failed_retry_counts_both_http_transports(self) -> None:
         analysis = _hierarchical_analysis_fixture(6)

@@ -416,12 +416,12 @@ function renderReport(markdown, llm, analysis = {}) {
       : "LM 응답 안내";
     const inputScopeNotice = renderLmInputScopeNotice(llm);
     status = llm?.used
-      ? `<p><strong>에이전트:</strong> LM Studio Qwen 사용됨 (${escapeHtml(llm.model)})${llm.validation_mode === "relaxed" ? " / 자유 형식" : " / strict 검증"}</p>${inputScopeNotice}${
+      ? `<p><strong>에이전트:</strong> LM Studio 사용됨 (${escapeHtml(llm.model)})${llm.validation_mode === "relaxed" ? " / 자유 형식" : " / strict 검증"}</p>${inputScopeNotice}${
           warnings.length
             ? `<div class="llm-warning"><strong>${warningTitle}:</strong><ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
             : ""
         }`
-      : `<p><strong>에이전트:</strong> LM Studio Qwen 미사용${llm?.error ? ` - ${escapeHtml(llm.error)}` : ""}</p>`;
+      : `<p><strong>에이전트:</strong> ${llm?.report_fallback_used ? "로컬 보고서로 복구됨 · 완료된 청크 요약 보존" : "LM Studio 미사용"}${llm?.error ? ` - ${escapeHtml(llm.error)}` : ""}</p>`;
   }
   reportView.innerHTML = `${renderParserWarning(analysis)}${status}${renderHierarchicalLmStatus(llm)}${markdownToHtml(String(markdown || ""))}${renderPrintAnalysisAppendix(analysis, llm)}${renderPrintNetworkAppendix(analysis)}`;
 }
@@ -441,6 +441,7 @@ function renderHierarchicalLmStatus(llm) {
   const chunkCount = finiteCount(llm.hierarchical_chunk_count) ?? 0;
   const completed = finiteCount(llm.hierarchical_chunks_completed) ?? 0;
   const failed = finiteCount(llm.hierarchical_chunks_failed) ?? 0;
+  const recovered = finiteCount(llm.hierarchical_chunks_recovered) ?? 0;
   const selected = finiteCount(llm.hierarchical_selected_evidence_count);
   const source = finiteCount(llm.hierarchical_source_evidence_count);
   const omitted = finiteCount(llm.hierarchical_evidence_omitted) ?? 0;
@@ -460,7 +461,8 @@ function renderHierarchicalLmStatus(llm) {
       : "사용 안 함";
   const details = [];
   if (used || chunkCount) {
-    details.push(`시간 청크 ${chunkCount}개 · 완료 ${completed}개 · 실패 ${failed}개`);
+    details.push(`시간 청크 ${chunkCount}개 · LM 완료 ${completed}개 · 로컬 근거 보완 ${recovered}개`);
+    if (failed > recovered) details.push(`미복구 ${failed - recovered}개`);
   }
   if (selected !== null && (used || selected > 0 || (source ?? 0) > 0)) {
     details.push(source !== null ? `선별 근거 ${selected}/${source}건` : `선별 근거 ${selected}건`);
@@ -724,6 +726,8 @@ function historyAnalysisFallback(analysis) {
     scenario_candidates: asList(source.scenario_candidates).slice(0, 8),
     attack_scenarios: asList(source.attack_scenarios).slice(0, 8),
     intrusion_chain: source.intrusion_chain,
+    report_evidence_scope: source.report_evidence_scope,
+    endpoint_rule_scope: source.endpoint_rule_scope,
     adaptive_time_range: source.adaptive_time_range,
     network_activity: source.network_activity,
     history_limitation: "브라우저 저장 한도로 대표 분석 근거만 보존되었습니다.",
@@ -779,6 +783,12 @@ function minimalHistoryAnalysis(analysis) {
         confidence: chain.confidence,
         confidence_scope: chain.confidence_scope,
         origin_process: origin,
+        origin_assessment: chain.origin_assessment,
+        initiating_process_candidate: chain.initiating_process_candidate,
+        observed_trigger_process: chain.observed_trigger_process,
+        upstream_process_context: asList(chain.upstream_process_context).slice(0, 8),
+        file_provenance: asList(chain.file_provenance).slice(0, 8),
+        payload_artifacts: asList(chain.payload_artifacts).slice(0, 8),
         steps: asList(chain.steps).slice(0, 8),
         truncated: chain.truncated === true || asList(chain.steps).length > 8,
         chain_truncated: chain.chain_truncated === true || asList(chain.steps).length > 8,
@@ -845,6 +855,13 @@ function historyLmMetadata(llm) {
     "hierarchical_chunk_count",
     "hierarchical_chunks_completed",
     "hierarchical_chunks_failed",
+    "hierarchical_chunks_recovered",
+    "report_fallback_used",
+    "chunk_summaries_preserved",
+    "partial_report_used",
+    "report_evidence_count",
+    "report_evidence_appended",
+    "report_evidence_scope",
     "hierarchical_round_count",
     "hierarchical_request_count",
     "hierarchical_transport_request_count",
@@ -861,7 +878,7 @@ function historyLmMetadata(llm) {
   }
   return historySafeClone(
     safe,
-    { arrayLimit: 20, objectLimit: 40, stringLimit: 2000, depthLimit: 5 },
+    { arrayLimit: 20, objectLimit: 80, stringLimit: 2000, depthLimit: 6 },
   );
 }
 
@@ -1198,7 +1215,7 @@ function renderIntrusionChain(chain) {
       ? `GUID ${origin.parent_process_guid || parentContext.process_guid}`
       : "",
   ]);
-  const stepRows = steps.slice(0, 96).map((step) => {
+  const stepRows = steps.map((step) => {
     const destination = formatNetworkEndpoint(
       step.destination_hostname || step.destination_ip,
       step.destination_port,
@@ -1219,8 +1236,10 @@ function renderIntrusionChain(chain) {
       <td>${renderMultilineCell([
         step.query_name ? `DNS ${step.query_name}` : "",
         destination,
+        step.target_filename,
+        step.command_line,
         step.assessment,
-      ])}</td>
+      ])}${renderDecodedPowershell(step.decoded_powershell)}</td>
       <td>${evidenceRefs.length ? evidenceRefs.map(escapeHtml).join("<br>") : "-"}</td>
     </tr>`;
   }).join("");
@@ -1229,13 +1248,76 @@ function renderIntrusionChain(chain) {
     <p><strong>판정:</strong> 침해 확정이 아닌 시작 프로세스 후보 · 연결 신뢰도 ${escapeHtml(chain.confidence || "unknown")}</p>
     <p><strong>시작 후보:</strong> ${originDetails.length ? originDetails.map(escapeHtml).join(" / ") : "확인 불가"}</p>
     ${origin.command_line ? `<p><strong>명령줄:</strong> <code>${escapeHtml(origin.command_line)}</code></p>` : ""}
+    ${renderOriginInvestigation(chain)}
+    ${renderDecodedPowershell(origin.decoded_powershell)}
     ${parentDetails.length ? `<p><strong>부모 문맥:</strong> ${parentDetails.map(escapeHtml).join(" / ")}</p>` : ""}
     ${stepRows ? `<table class="evidence-table intrusion-chain-table">
       <thead><tr><th>순서</th><th>시간</th><th>단계</th><th>프로세스</th><th>행위·목적지</th><th>근거</th></tr></thead>
       <tbody>${stepRows}</tbody>
     </table>` : "<p>표시할 후속 단계가 없습니다.</p>"}
     ${chain.truncated === true ? '<p class="scope-note"><strong>범위 주의:</strong> 상한에 맞춘 대표 체인입니다.</p>' : ""}
-    ${renderValueList("체인 분석 한계", limitations.slice(0, 8))}
+    ${renderValueList("체인 분석 한계", limitations)}
+  </section>`;
+}
+
+function renderOriginInvestigation(chain) {
+  const trigger = chain.observed_trigger_process;
+  const context = asList(chain.upstream_process_context).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const provenance = asList(chain.file_provenance).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const assessment = chain.origin_assessment;
+  const assessmentText = typeof assessment === "string" ? assessment
+    : assessment?.description || assessment?.assessment || assessment?.note || chain.origin_process?.assessment;
+  const contextRows = context.map((item) => `<tr>
+    <td>${escapeHtml(item.start_time || item.time || "시간 불명")}</td>
+    <td>${renderMultilineCell([item.process, item.process_id ? `PID ${item.process_id}` : "", item.command_line])}</td>
+    <td>${renderMultilineCell([item.relationship_basis || item.parent_link_basis, item.assessment || item.note, item.source_ref])}</td>
+  </tr>`).join("");
+  const fileRows = provenance.map((item) => `<tr>
+    <td>${escapeHtml(item.time || item.creation_time || "시간 불명")}</td>
+    <td>${escapeHtml(item.target_filename || item.path || item.target_file || "-")}</td>
+    <td>${renderMultilineCell([item.creator_process?.process || item.creator_process || item.process, item.creator_process_id ? `PID ${item.creator_process_id}` : "", item.relationship_basis, item.source_ref, ...asList(item.source_refs), item.assessment || item.note, item.limitation])}</td>
+  </tr>`).join("");
+  const artifacts = asList(chain.payload_artifacts).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const artifactRows = artifacts.map((item) => `<tr>
+    <td>${escapeHtml(item.process || "-")}</td>
+    <td>${escapeHtml(item.referenced_path || "-")}</td>
+    <td>${renderMultilineCell([item.source_ref, ...asList(item.creation_source_refs), item.limitation])}</td>
+  </tr>`).join("");
+  return `${assessmentText ? `<p><strong>최초 유발 원인 평가:</strong> ${escapeHtml(assessmentText)}</p>` : ""}
+    ${trigger?.process ? `<p><strong>관측된 의심 실행:</strong> ${escapeHtml(trigger.process)}${trigger.process_id ? ` / PID ${escapeHtml(trigger.process_id)}` : ""} · ${escapeHtml(trigger.start_time || "시작 시각 불명")}</p>` : ""}
+    ${contextRows ? `<h3>상위 프로세스 추적 근거</h3><table class="evidence-table"><thead><tr><th>시간</th><th>프로세스·명령</th><th>연결 근거</th></tr></thead><tbody>${contextRows}</tbody></table>` : ""}
+    ${fileRows ? `<h3>실행 파일 유입·생성 근거</h3><table class="evidence-table"><thead><tr><th>시간</th><th>생성 파일</th><th>생성 프로세스·원본 근거</th></tr></thead><tbody>${fileRows}</tbody></table>` : ""}
+    ${artifactRows ? `<h3>실행 도구에 전달된 파일</h3><table class="evidence-table"><thead><tr><th>실행 도구</th><th>참조한 파일</th><th>참조·생성 근거와 한계</th></tr></thead><tbody>${artifactRows}</tbody></table>` : ""}
+    ${renderValueList("최초 유입 확인에 필요한 근거", assessment?.missing_evidence)}`;
+}
+
+function renderDecodedPowershell(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.status === "not_encoded") return "";
+  const scripts = asList(value.decoded_scripts).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const statusLabels = {
+    decoded: "디코딩됨", partial: "일부 디코딩", invalid: "디코딩 불가",
+    failed: "디코딩 불가", unsupported: "정적 디코딩 범위 밖",
+  };
+  const bodies = scripts.map((item) => `<div class="decoded-script">
+    <p>${renderMultilineCell([
+      item.source, item.method, item.encoding, item.depth ? `깊이 ${item.depth}` : "",
+    ])}</p>
+    <pre><code>${escapeHtml(item.text || "")}</code></pre>
+    ${renderValueList("정적 분석 신호", item.signals)}
+    ${item.text_truncated ? '<p class="scope-note">디코딩 본문이 보존 상한으로 일부 생략되었습니다.</p>' : ""}
+  </div>`).join("");
+  return `<section class="decoded-powershell" aria-label="PowerShell Base64 정적 분석">
+    <h4>PowerShell Base64 분석 · ${escapeHtml(statusLabels[value.status] || value.status || "검사됨")}</h4>
+    <p>실행 없이 디코딩한 내용입니다. 실제 실행 및 침해 여부는 프로세스·통신 근거와 함께 판단합니다.</p>
+    ${bodies}${renderValueList("디코딩 한계", value.warnings)}
   </section>`;
 }
 
@@ -1505,6 +1587,7 @@ function collectPrintEvidenceLimitations(analysis, llm) {
     : {};
   const values = [
     ...asList(analysis.evidence_limitations).map(formatEvidenceLimitation),
+    ...asList(analysis.report_evidence_scope?.limitations).map(formatEvidenceLimitation),
     ...asList(intrusionChain.limitations).map(formatEvidenceLimitation),
     ...asList(parser.errors),
     ...asList(llm?.hierarchical_validation_warnings),
@@ -1539,7 +1622,11 @@ function collectPrintEvidenceLimitations(analysis, llm) {
   const hierarchicalOmitted = finiteCount(llm?.hierarchical_evidence_omitted) ?? 0;
   const hierarchicalRepetitionsOmitted = finiteCount(llm?.hierarchical_repetition_omitted) ?? 0;
   if (hierarchicalFailures) {
-    values.push(`계층형 LM 시간 청크 ${hierarchicalFailures}개가 실패하여 해당 범위는 최종 종합에서 부분적으로만 반영되었습니다.`);
+    const recovered = finiteCount(llm?.hierarchical_chunks_recovered) ?? 0;
+    values.push(`계층형 LM 시간 청크 ${hierarchicalFailures}개에서 응답을 얻지 못했습니다. 그중 ${recovered}개는 해당 구간의 로컬 근거 요약으로 보완했습니다.`);
+  }
+  if (llm?.report_fallback_used === true) {
+    values.push("최종 LM 보고서 대신 로컬 분석 보고서와 보존된 청크 요약을 사용했습니다.");
   }
   if (hierarchicalOmitted) {
     values.push(`계층형 분석 입력 상한으로 선별 근거 ${hierarchicalOmitted}건이 시간 청크 입력에서 제외되었습니다.`);
@@ -1673,6 +1760,7 @@ function renderSuspiciousEvent(item) {
     </table>
     <p><strong>원본 위치:</strong> ${escapeHtml(item.provider || "-")} / ${escapeHtml(item.channel || "-")} / ${escapeHtml(item.source_file || "-")} / record ${escapeHtml(item.record_id || "-")}</p>
     ${renderEventFields(item.fields)}
+    ${renderDecodedPowershell(item.decoded_powershell)}
   </section>`;
 }
 
@@ -1868,6 +1956,7 @@ function renderFinding(finding) {
       <thead><tr><th>시간</th><th>ID</th><th>호스트 / 계정</th><th>출발지</th><th>목적지 / DNS / 통신</th><th>명령 / 프로세스 / PID·GUID</th></tr></thead>
       <tbody>${evidenceRows}</tbody>
     </table>
+    ${asList(finding.evidence).map((item) => renderDecodedPowershell(item?.decoded_powershell)).join("")}
   </section>`;
 }
 
@@ -2009,6 +2098,8 @@ function renderIntrusionChainSummary(chain) {
     ["식별 상태", chain.status || "근거 부족"],
     ["연결 신뢰도", chain.confidence || "unknown"],
     ["시작 프로세스 후보", origin?.process || "식별되지 않음"],
+    ["관측된 의심 실행", chain.observed_trigger_process?.process],
+    ["최초 유발 프로세스 후보", chain.initiating_process_candidate?.process],
     ["시작 시각", origin?.start_time || "확인 불가"],
     ["PID", origin?.process_id],
     ["ProcessGuid", origin?.process_guid],
@@ -2190,7 +2281,26 @@ function markdownToHtml(markdown) {
   const lines = markdown.split(/\r?\n/);
   const html = [];
   let inList = false;
+  let fence = null;
+  let codeLines = [];
   for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (fenceMatch && fenceMatch[1][0] === fence[0]
+          && fenceMatch[1].length >= fence.length && !fenceMatch[2].trim()) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        fence = null;
+        codeLines = [];
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+    if (fenceMatch) {
+      if (inList) { html.push("</ul>"); inList = false; }
+      fence = fenceMatch[1];
+      continue;
+    }
     if (line.startsWith("#### ")) {
       if (inList) {
         html.push("</ul>");
@@ -2234,6 +2344,7 @@ function markdownToHtml(markdown) {
       html.push(`<p>${inlineMarkdown(line)}</p>`);
     }
   }
+  if (fence) html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
   if (inList) html.push("</ul>");
   return html.join("");
 }

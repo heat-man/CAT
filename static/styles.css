@@ -457,6 +457,22 @@ select:focus {
   margin-bottom: 24px;
 }
 
+.decoded-powershell {
+  margin: 12px 0;
+  padding: 12px;
+  border-left: 3px solid var(--line);
+  background: #f5f8f7;
+}
+
+.tab-view pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  padding: 12px;
+  background: #f5f8f7;
+  max-width: 100%;
+}
+
 .intrusion-chain-table td:nth-child(5),
 .intrusion-chain-table td:nth-child(6) {
   min-width: 180px;

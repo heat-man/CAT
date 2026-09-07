@@ -65,6 +65,8 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 | `CAT_LM_HIERARCHICAL_CONTEXT_CHARS` | `20480` | 최종 요청에 넣을 전체 계층형 문맥 상한, 4096~262144자; 실제값은 전체 입력 예산에 맞게 축소 |
 | `CAT_LM_HIERARCHICAL_MAX_TOKENS` | `2048` | 중간 청크 응답 token 상한, 256~8192 및 `CAT_LM_MAX_TOKENS` 이하 |
 | `CAT_LM_HIERARCHICAL_SOURCE_EVENTS` | `10000` | 계층형 후보 수집 단계의 최대 근거 수, 100~100000 |
+| `CAT_REPORT_EVIDENCE_MAX_EVENTS` | `4096` | LM 입력과 독립적인 보고서용 로컬 규칙 근거 수, 32~20000 |
+| `CAT_REPORT_EVIDENCE_MAX_CHARS` | `8388608` | 보고서용 근거 JSON 문자 예산, 65536~33554432 |
 | `CAT_BROWSER_ALLOWED_ORIGINS` | 빈값 | HTTPS 역방향 프록시 등에서 허용할 공개 웹 origin(`scheme://host:port`) 목록 |
 | `CAT_UPLOAD_TIMEOUT_SECONDS` | `900` | 업로드 본문 전체 수신 제한, 10~7200초 |
 | `CAT_XML_MAX_FILE_BYTES` | `134217728` | 단일 XML 파일 제한, 최대 512MiB |
@@ -221,7 +223,7 @@ CAT 릴리스에는 모델 가중치가 포함되지 않습니다. 독립망 모
 4. finding과 시나리오에 연결된 evidence를 먼저 선택하고, high severity·high confidence·명령줄/IP/프로세스 등 실제 관측값이 풍부한 의심 이벤트를 우선합니다.
 5. 반복되는 낮은 우선순위 Sysmon/timeline 항목은 대표 항목만 남기고, finding·의심 이벤트·시나리오·timeline의 개수 제한과 개별 필드 제한을 적용합니다.
 6. 전체 선별 JSON을 기본 49,152자 예산 안으로 줄이고 `_input_limits` 및 LM 상태 metadata에 원본/포함 개수와 축약 여부를 기록합니다. 전체 범위 이벤트가 대표 근거보다 많아도 축약으로 표시합니다.
-7. `strict=false`이고 선별 근거가 계층형 기준을 넘으면 시간순 청크별 자유 응답을 만들고, 제한된 누적 사건 상태를 다음 청크에 전달합니다. 마지막 요청은 청크 요약과 CAT의 canonical `intrusion_chain`·`adaptive_time_range`를 함께 사용해 최초 의심 프로세스와 후속 행위를 종합합니다. 실패한 청크는 표시하되 기존 대표 근거를 이용한 최종 요청은 계속합니다.
+7. `strict=false`이고 선별 근거가 계층형 기준을 넘으면 시간순 청크별 자유 응답을 만들고, 제한된 누적 사건 상태를 다음 청크에 전달합니다. 빈 content는 같은 deadline 안에서 thinking을 끄고 한 번 재시도하며, 호환 재시도를 포함해 청크당 최대 2회 POST합니다. 실패한 청크는 해당 구간의 로컬 근거 요약으로 보완해 다음 단계로 이어갑니다. 마지막 요청은 청크 요약과 CAT의 canonical `intrusion_chain`·`adaptive_time_range`를 함께 사용해 상위 원인 프로세스·파일 유입과 후속 행위를 종합합니다. 최종 요청 실패 시 로컬 보고서와 완료된 청크 요약을 보존합니다.
 8. `strict=false` 최종 요청은 `response_format` 없이 근거 기반 한국어 자유 보고서를 요청합니다. 일부 JSON, Markdown, code fence와 일반 텍스트를 모두 허용합니다. 완전한 기존 CAT JSON은 검증 renderer로, 호환 가능한 CAT 부분 구조는 canonical 사실로 보정한 renderer로 처리하며 그 밖의 응답은 원문으로 사용합니다.
 9. `strict=true`이면 계층형 사전 호출 없이 단 한 번의 `response_format=json_schema` 요청으로 required section, event/scenario 참조 검증과 고정 Markdown renderer를 사용합니다.
 10. 입력이 축약된 경우 LM 프롬프트, 자유 `report_markdown`의 `CAT 입력 증거 범위`(구조화 보고서는 8번 증거 한계), API metadata와 UI에 전체 이벤트 중 일부 대표 근거만 제공됐음을 명시합니다.
@@ -249,6 +251,18 @@ EVTX 필드와 명령줄은 공격자가 조작할 수 있는 비신뢰 데이�
 - `process`, `command_line`, `process_id`, `process_guid`
 
 값을 추출할 수 없으면 빈 값으로 남기며 다른 이벤트의 값을 관측 사실처럼 복사하지 않습니다. UI는 canonical 키를 우선하고 구버전 응답과 raw `fields`의 Sysmon/Security 키를 방어적으로 읽습니다. 모든 값은 HTML escape 후 표시합니다.
+
+### 부분 실패 복구와 보고서 근거 보존
+
+`hierarchical_chunks_completed`는 LM 응답을 얻은 청크 수, `hierarchical_chunks_failed`는 LM 호출에 실패한 청크 수, `hierarchical_chunks_recovered`는 그중 로컬 근거로 보완한 수입니다. `hierarchical_chunks[].summary_source`는 `lm_working_hypothesis` 또는 `deterministic_evidence`로 구분됩니다. `report_fallback_used`, `partial_report_used`, `chunk_summaries_preserved`는 최종 LM 요청 실패 후 보존한 보고서와 중간 요약을 나타냅니다. 빈 응답 재시도도 원래 청크 timeout과 최대 2회 HTTP 요청 예산을 공유합니다.
+
+`analysis.report_evidence`는 로컬 finding의 대표 샘플 선정 전에 모은 근거입니다. 자유 형식/규칙 보고서의 시간순 부록은 이 목록과 기존 의심 이벤트·체인 근거를 사용하므로 최종 LM 입력에 없었던 기록도 확인할 수 있습니다. 원본 파일·Record ID·시각이 있는 기존 이벤트는 `EVT-...` 참조를 유지하고 추가 근거는 `RPT-...`로 식별합니다. `report_evidence_scope`의 `included_event_count`, `omitted_event_references`, `upstream_omitted_event_references`, `input_scan_limited`, `limitations`를 함께 표시합니다. 생략 수는 같은 이벤트의 다중 규칙 참조를 포함할 수 있어 고유 이벤트 수와 다릅니다. 총 보존 상한 초과 시 각 규칙의 시간 경계와 높은 심각도를 우선하며, 원본 전체를 복원하지는 않습니다.
+
+### PowerShell 디코딩과 상위 실행 원인
+
+`decoded_powershell`에는 정적 디코딩 `status`, `decoded_scripts`, `signals`, `warnings`, `truncated`가 있습니다. 각 본문은 원본 필드 출처, 디코딩 방법·깊이·인코딩·해시와 함께 유지됩니다. 입력 131072자, Base64 인수 65536자, 최대 3단계·8개 본문, 본문당 12000자·전체 32768자 상한을 적용합니다. 변수 계산·코드 실행·압축 해제는 하지 않습니다. Base64 사용 자체는 악성 판단 근거가 아니며 정적 신호는 실제 프로세스·통신 관측과 구분됩니다.
+
+`intrusion_chain`은 `observed_trigger_process`에서 상위 프로세스와 Sysmon 11의 생성 파일 출처를 추적합니다. `origin_process`/`initiating_process_candidate`, `origin_assessment`, `upstream_process_context`, `file_provenance`가 원인 후보와 관측된 LOLBin을 구분합니다. 파일 경로·시각 일치는 파일 바이트 동일성이나 악성 판정을 보장하지 않습니다. 부모/파일 유입 근거가 없을 때 최초 유입을 확정하지 않습니다.
 
 상관 분석은 같은 호스트의 Sysmon 이벤트에 대해 동일 `ProcessGuid`를 가장 강한 연결 근거로 사용합니다. GUID가 없을 때만 동일 호스트·PID·프로세스 경로와 10분 시간창으로 프로세스 생성을 연결합니다. DNS는 동일 GUID 또는 PID와 5분 시간창을 요구하고, 연결 이벤트에 hostname이 있으면 질의 이름도 일치해야 합니다. Security 5156은 `Application`, Process ID와 근접한 시간을 보조 근거로 사용할 수 있지만 PID 재사용과 로그 지연 가능성이 있으므로 더 낮은 확신으로 취급합니다. DNS 이름과 목적지 IP가 같은 시간대에 관찰됐다는 사실만으로 둘 사이의 해석되지 않은 매핑을 만들지 않습니다.
 

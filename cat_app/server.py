@@ -28,6 +28,7 @@ from .adaptive_range import (
 )
 from .analyzer import analyze_events
 from .evtx_reader import XML_PARSE_TIMEOUT_SECONDS, parse_event_files
+from .report_evidence import REPORT_EVIDENCE_MAX_CHARS, REPORT_EVIDENCE_MAX_EVENTS
 from .reporting import (
     DEFAULT_LM_MAX_FIELD_CHARS,
     DEFAULT_LM_MAX_INPUT_CHARS,
@@ -291,6 +292,10 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                         "max_timeline_events": MAX_LM_TIMELINE_EVENTS,
                     },
                     "codex_dev_enabled": CODEX_DEV_ENABLED,
+                    "report_evidence_limits": {
+                        "max_events": REPORT_EVIDENCE_MAX_EVENTS,
+                        "max_chars": REPORT_EVIDENCE_MAX_CHARS,
+                    },
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                     "upload_timeout_seconds": DEFAULT_UPLOAD_TIMEOUT_SECONDS,
                     "xml_parse_timeout_seconds": XML_PARSE_TIMEOUT_SECONDS,

@@ -163,6 +163,18 @@ def _analysis_signal_times(analysis: dict[str, Any]) -> list[datetime]:
                 continue
             values.extend((finding.get("first_seen"), finding.get("last_seen")))
 
+    chain = analysis.get("intrusion_chain")
+    if isinstance(chain, dict) and chain.get("origin_process"):
+        # Use actual observed starts in the evidence-linked causal chain. A
+        # free-text hypothesis or arbitrary requested date must not expand it.
+        for key in ("origin_process", "initiating_process_candidate", "observed_trigger_process"):
+            process = chain.get(key)
+            if isinstance(process, dict) and process.get("creation_event_observed"):
+                values.append(process.get("start_time"))
+        for link in chain.get("file_provenance") or []:
+            if isinstance(link, dict) and link.get("source_refs"):
+                values.append(link.get("time"))
+
     parsed: list[datetime] = []
     for value in values:
         if isinstance(value, datetime):

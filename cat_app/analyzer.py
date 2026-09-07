@@ -12,6 +12,8 @@ import statistics
 from typing import Any, Callable, Iterable, Iterator
 
 from .models import EventRecord, ParseResult
+from .powershell import analyze_powershell_content, powershell_code_text
+from .report_evidence import capture_report_evidence, record_finding_evidence
 from .timeutil import isoformat_utc
 
 SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -49,6 +51,13 @@ INTRUSION_SUSPICIOUS_EVENT_LIMIT = 512
 INTRUSION_ORIGIN_ALTERNATIVE_LIMIT = 5
 INTRUSION_DESCENDANT_DEPTH_LIMIT = 8
 INTRUSION_PID_LINK_WINDOW_SECONDS = 60 * 60
+INTRUSION_ANCESTOR_DEPTH_LIMIT = 16
+INTRUSION_FILE_LINK_WINDOW_SECONDS = 24 * 60 * 60
+INTRUSION_FILE_MATCH_LIMIT = 50_000
+INTRUSION_FILE_MATCHES_PER_PATH_LIMIT = 32
+ENDPOINT_RULE_EXTRA_RECORD_LIMIT = 8192
+ENDPOINT_RULE_EXTRA_CHAR_LIMIT = 16 * 1024 * 1024
+EVIDENCE_TEXT_CHAR_LIMIT = 8192
 
 C2_SCORE_VERSION = 1
 C2_SCORE_WEIGHTS = {
@@ -180,6 +189,7 @@ POWERSHELL_KEYWORDS = [
 ]
 
 
+@capture_report_evidence
 def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_utc: datetime | None) -> dict[str, Any]:
     records = sorted(
         parse_result.records,
@@ -209,8 +219,9 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
     findings.extend(_remote_logon_findings(records))
     findings.extend(_explicit_credential_findings(records))
     findings.extend(_privileged_logon_findings(records))
-    findings.extend(_suspicious_process_findings(records))
-    findings.extend(_powershell_findings(records))
+    endpoint_rule_records, endpoint_rule_scope = _endpoint_rule_records(parse_result, records)
+    findings.extend(_suspicious_process_findings(endpoint_rule_records))
+    findings.extend(_powershell_findings(endpoint_rule_records))
     findings.extend(network_findings)
 
     findings = sorted(
@@ -251,6 +262,7 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
             "network_scan_complete": parse_result.network_scan_complete,
         },
         "parser": parse_result.to_dict(),
+        "endpoint_rule_scope": endpoint_rule_scope,
         "summary": _summary(records),
         "network_activity": network_activity,
         "findings": findings,
@@ -593,13 +605,73 @@ def _privileged_logon_findings(records: list[EventRecord]) -> list[dict[str, Any
     ]
 
 
+def _decoded_powershell(event: EventRecord) -> dict[str, Any]:
+    if not (_is_process_creation_event(event) or _is_powershell_event(event)):
+        return {}
+    command = _field(event, "CommandLine", "ProcessCommandLine") or ""
+    script = _field(event, "ScriptBlockText", "ScriptBlock", "Payload") or ""
+    if not _is_powershell_event(event) and not any(
+        token in command.casefold()
+        for token in ("powershell", "pwsh", "frombase64string")
+    ) and _windows_basename(_process(event)) not in {"powershell.exe", "pwsh.exe"}:
+        return {}
+    result = analyze_powershell_content(command_line=command, script_block=script)
+    return result if result.get("status") != "not_encoded" else {}
+
+
+def _endpoint_rule_records(
+    parsed: ParseResult,
+    retained: list[EventRecord],
+) -> tuple[list[EventRecord], dict[str, Any]]:
+    """Keep bounded high-signal tail events for local execution/script rules."""
+    result = list(retained)
+    extra_count = omitted_count = extra_chars = 0
+    if parsed.has_network_record_spool and parsed.record_limit_reached:
+        retained_ids = {_intrusion_raw_event_identity(event) for event in retained}
+        for event in parsed.iter_network_records():
+            if _intrusion_raw_event_identity(event) in retained_ids:
+                continue
+            if not (_is_process_creation_event(event) or _is_powershell_event(event)):
+                continue
+            if not _event_has_suspicious_command(event):
+                continue
+            event_chars = sum(len(key) + len(value) for key, value in {
+                **event.event_data, **event.user_data,
+            }.items())
+            if (
+                extra_count >= ENDPOINT_RULE_EXTRA_RECORD_LIMIT
+                or extra_chars + event_chars > ENDPOINT_RULE_EXTRA_CHAR_LIMIT
+            ):
+                omitted_count += 1
+                continue
+            result.append(event)
+            extra_count += 1
+            extra_chars += event_chars
+    result.sort(key=lambda event: _event_time_sort_key(event.time_created))
+    return result, {
+        "extra_records_included": extra_count,
+        "extra_record_limit": ENDPOINT_RULE_EXTRA_RECORD_LIMIT,
+        "extra_char_limit": ENDPOINT_RULE_EXTRA_CHAR_LIMIT,
+        "omitted_matching_records": omitted_count,
+        "truncated": bool(omitted_count or parsed.network_spool_limit_reached),
+        "note": "일반 보존 범위 밖의 의심 프로세스/PowerShell 로그도 endpoint spool에서 제한 범위 내 추가 분석합니다.",
+    }
+
+
 def _suspicious_process_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     matched_by_category: dict[str, list[EventRecord]] = defaultdict(list)
     for event in records:
         if not _is_process_creation_event(event):
             continue
-        text = f" {_event_text(event).lower()} "
+        decoded = _decoded_powershell(event)
+        decoded_text = " ".join(
+            powershell_code_text(str(item.get("text") or ""))
+            for item in decoded.get("decoded_scripts") or []
+        )
+        text = f" {_event_text(event).lower()} {decoded_text.lower()} "
         for category, keywords in SUSPICIOUS_COMMAND_KEYWORDS.items():
+            if category == "encoded powershell" and decoded.get("status") == "decoded" and not decoded.get("signals"):
+                continue
             if any(keyword in text for keyword in keywords):
                 matched_by_category[category].append(event)
 
@@ -626,10 +698,14 @@ def _suspicious_process_findings(records: list[EventRecord]) -> list[dict[str, A
 def _powershell_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
     events: list[EventRecord] = []
     for event in records:
-        if not _is_powershell_event(event):
+        if not (_is_powershell_event(event) or _is_process_creation_event(event)):
             continue
-        text = _event_text(event).lower()
-        if any(keyword in text for keyword in POWERSHELL_KEYWORDS):
+        decoded = _decoded_powershell(event)
+        text = powershell_code_text(_event_text(event)).lower()
+        if decoded.get("signals") or (
+            _is_powershell_event(event)
+            and any(keyword in text for keyword in POWERSHELL_KEYWORDS if keyword not in {"encodedcommand", "frombase64string"})
+        ):
             events.append(event)
     if not events:
         return []
@@ -639,7 +715,7 @@ def _powershell_findings(records: list[EventRecord]) -> list[dict[str, Any]]:
             "의심 PowerShell 스크립트 또는 명령",
             "high",
             events,
-            "PowerShell 로그에서 난독화, 다운로드 실행, 실행 정책 우회, 보안 우회 또는 공격 도구 키워드가 발견되었습니다.",
+            "PowerShell 원문 또는 안전하게 Base64 디코딩한 텍스트에서 다운로드 실행·보안 우회 등의 정적 신호가 발견되었습니다. 인코딩 자체나 문자열 존재만으로 악성 실행을 확정하지 않습니다.",
             "medium",
             [
                 "ScriptBlockText 원문과 실행 계정, 호스트, 부모 프로세스를 확인하세요.",
@@ -1947,7 +2023,7 @@ def _correlated_process_event(
             )
         return None, None, f"guid:{guid}", None
 
-    pid = _normalized_process_id(_field(event, "ProcessId", "ProcessID"))
+    pid = _process_id(event)
     if not pid:
         return None, None, None, None
     candidates = by_pid.get((host, pid), [])
@@ -2443,11 +2519,19 @@ def _network_finding_severity(summary: dict[str, Any]) -> str:
 
 def _event_has_suspicious_command(event: EventRecord) -> bool:
     text = f" {_event_text(event).casefold()} "
+    decoded = _decoded_powershell(event)
+    decoded_without_signals = decoded.get("status") == "decoded" and not decoded.get("signals")
     return any(
         keyword in text
-        for keywords in SUSPICIOUS_COMMAND_KEYWORDS.values()
+        for category, keywords in SUSPICIOUS_COMMAND_KEYWORDS.items()
+        if category != "encoded powershell" or not decoded_without_signals
         for keyword in keywords
-    ) or any(keyword in text for keyword in POWERSHELL_KEYWORDS)
+    ) or any(
+        keyword in text for keyword in POWERSHELL_KEYWORDS
+        if keyword not in {"encodedcommand", "frombase64string"} or not decoded_without_signals
+    ) or bool(
+        decoded.get("signals")
+    )
 
 
 def _is_user_writable_process_path(value: Any) -> bool:
@@ -2541,6 +2625,7 @@ def _timeline(records: list[EventRecord], findings: list[dict[str, Any]]) -> lis
                     "process": evidence.get("process"),
                     "process_id": evidence.get("process_id"),
                     "process_guid": evidence.get("process_guid"),
+                    "execution_process_id": evidence.get("execution_process_id"),
                     "query_name": evidence.get("query_name"),
                     "network_direction": evidence.get("network_direction"),
                 }
@@ -2617,6 +2702,9 @@ def _suspicious_events(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "query_name": evidence.get("query_name"),
                     "network_direction": evidence.get("network_direction"),
                     "command_line": evidence.get("command_line"),
+                    "decoded_powershell": evidence.get("decoded_powershell") or {},
+                    "execution_process_id": evidence.get("execution_process_id"),
+                    "text_truncated_fields": evidence.get("text_truncated_fields") or [],
                     "fields": dict(evidence.get("fields") or {}),
                     "severity": severity,
                     "confidence": confidence,
@@ -2713,6 +2801,7 @@ class _IntrusionProcessNode:
     creation_event_refs: list[str] = field(default_factory=list)
     rule_ids: list[str] = field(default_factory=list)
     severities: list[str] = field(default_factory=list)
+    decoded_powershell: dict[str, Any] = field(default_factory=dict)
 
 
 def _iter_intrusion_source_records(
@@ -2847,6 +2936,10 @@ def _intrusion_chain(
             or pid_image in priority_pid_images
             or node.local_signals
             or (
+                len(nodes) >= INTRUSION_PROCESS_NODE_LIMIT
+                and _intrusion_upstream_source_candidate(node)
+            )
+            or (
                 node.parent_process_guid
                 and (node_host, node.parent_process_guid) in important_guids
             )
@@ -2864,6 +2957,7 @@ def _intrusion_chain(
     raw_event_refs: dict[tuple[str, ...], str] = {}
     event_node_keys: dict[str, tuple[str, ...]] = {}
     synthetic_node_count = 0
+    pid_evidence_link_count = 0
 
     for event in selected_suspicious:
         event_ref = str(event.get("event_ref") or "")
@@ -2893,6 +2987,13 @@ def _intrusion_chain(
         if node_key is None:
             continue
         node = nodes[node_key]
+        if (
+            node.creation_observed
+            and raw_index.get(raw_identity) != node_key
+            and not _normalized_process_guid(event.get("process_guid") or (event.get("fields") or {}).get("ProcessGuid"))
+            and _intrusion_dict_process_id(event)
+        ):
+            pid_evidence_link_count += 1
         _append_bounded_unique(node.event_refs, event_ref, 64)
         if raw_index.get(raw_identity) == node_key and str(event.get("event_id") or "") in {
             "1",
@@ -2968,6 +3069,7 @@ def _intrusion_chain(
         "network_spool_limit_reached": network_spool_limit_reached,
         "suspicious_event_count": len(suspicious_events),
         "suspicious_events_used": len(selected_suspicious),
+        "pid_evidence_link_count": pid_evidence_link_count,
     }
     if not ranked_candidates:
         limitations = [
@@ -2982,6 +3084,19 @@ def _intrusion_chain(
             "confidence": "unknown",
             "confidence_scope": "프로세스 및 이벤트 연결 신뢰도이며 악성 여부 신뢰도가 아닙니다.",
             "origin_process": None,
+            "observed_trigger_process": None,
+            "initiating_process_candidate": None,
+            "origin_assessment": {
+                "status": "initial_source_unresolved",
+                "malware_confirmed": False,
+                "initial_compromise_confirmed": False,
+                "candidate_only": True,
+                "assessment": "최초 침해 유발 주체를 확인할 증거가 부족합니다.",
+                "missing_evidence": ["프로세스와 연결 가능한 의심 실행 증거가 없습니다."],
+            },
+            "upstream_process_context": [],
+            "file_provenance": [],
+            "payload_artifacts": [],
             "alternative_origin_candidates": [],
             "processes": [],
             "steps": [],
@@ -3003,7 +3118,13 @@ def _intrusion_chain(
             "limitations": limitations,
         }
 
-    _, origin_key, primary_signal_keys = ranked_candidates[0]
+    _, observed_trigger_key, primary_signal_keys = ranked_candidates[0]
+    file_links, file_link_limit_reached = _intrusion_file_provenance(
+        record_source, nodes, guid_index, pid_index,
+    )
+    origin_key, upstream_keys, file_provenance, upstream_gaps, upstream_limit_reached = _intrusion_trace_upstream(
+        observed_trigger_key, nodes, file_links,
+    )
     origin = nodes[origin_key]
     children = _intrusion_children_index(nodes)
     relevant_keys, descendant_limit_reached = _intrusion_relevant_processes(
@@ -3012,6 +3133,15 @@ def _intrusion_chain(
         nodes,
         children,
     )
+    # Preserve upstream observations without labelling normal applications as
+    # malicious, and without expanding their unrelated child processes.
+    upstream_context_keys = set(upstream_keys) - set(primary_signal_keys) - {origin_key}
+    for key in upstream_keys:
+        if key not in relevant_keys:
+            if len(relevant_keys) >= INTRUSION_CHAIN_PROCESS_LIMIT:
+                upstream_limit_reached = True
+                break
+            relevant_keys.append(key)
     unresolved_parent_count = sum(
         1
         for key in relevant_keys
@@ -3082,6 +3212,8 @@ def _intrusion_chain(
             role=(
                 "origin_candidate"
                 if key == origin_key
+                else "upstream_context"
+                if key in upstream_context_keys
                 else "suspicious_descendant"
                 if key in signal_keys
                 else "descendant_context"
@@ -3095,6 +3227,7 @@ def _intrusion_chain(
             nodes[key],
             origin=(key == origin_key),
             suspicious=(key in signal_keys),
+            upstream_context=(key in upstream_context_keys),
             nodes=nodes,
         )
         for key in relevant_keys
@@ -3111,6 +3244,23 @@ def _intrusion_chain(
         _intrusion_followon_step(group, nodes[group["node_key"]])
         for group in followon_groups.values()
     )
+    steps.extend({
+        "time": link.get("time"),
+        "event_kind": "file_provenance",
+        "phase": "실행 파일 생성 경위",
+        "assessment": "실행 파일과 같은 경로에 선행 파일 생성이 관측됨; 동일 바이너리 및 악성 여부 미확정",
+        "host": (link.get("sample_evidence") or {}).get("host"),
+        "process": link.get("creator_process"),
+        "process_id": link.get("creator_process_id"),
+        "process_guid": link.get("creator_process_guid"),
+        "process_instance_id": link.get("creator_process_instance_id"),
+        "target_process_instance_id": link.get("target_process_instance_id"),
+        "target_filename": link.get("target_filename"),
+        "relationship_basis": link.get("relationship_basis"),
+        "event_id": "11", "event_count": 1, "event_refs": [],
+        "source_refs": link.get("source_refs") or [],
+        "sample_evidence": link.get("sample_evidence"),
+    } for link in file_provenance)
     steps, omitted_step_count = _limit_intrusion_steps(steps)
 
     component_rules = sorted(
@@ -3133,6 +3283,8 @@ def _intrusion_chain(
         nodes,
         component_rules,
     )
+    if file_provenance or pid_parent_link_count or pid_evidence_link_count:
+        confidence = "low"
     parent_context = _intrusion_parent_context(origin, nodes)
     origin_basis = _intrusion_origin_basis(
         origin,
@@ -3140,11 +3292,19 @@ def _intrusion_chain(
         nodes,
         component_rules,
     )
+    if origin_key != observed_trigger_key:
+        origin_basis.insert(0, "최초 관측 의심 실행보다 앞선 부모 계보 또는 파일 생성 경위에서 실행 유발 주체를 역추적했습니다.")
     alternatives = [
         _intrusion_origin_candidate(nodes[root], members, nodes)
         for _, root, members in ranked_candidates[1 : 1 + INTRUSION_ORIGIN_ALTERNATIVE_LIMIT]
     ]
     limitations = list(base_limitations)
+    limitations.extend(upstream_gaps)
+    limitations.append("LOLBIN/스크립트 실행은 관측된 공격 동작일 수 있으며 최초 유입 악성 파일을 뜻하지 않습니다. 시작 후보의 악성 여부는 파일·해시·EDR 등으로 추가 확인해야 합니다.")
+    if file_provenance:
+        limitations.append("파일 생성 경위 연결은 동일 호스트·경로·선후 시간 기반 가설이며 같은 바이너리의 실행을 확정하지 않습니다.")
+    if file_link_limit_reached or upstream_limit_reached:
+        limitations.append("선행 계보/파일 생성 경위 추적이 설정된 노드·깊이·경로별 연결 상한에 도달했습니다.")
     if unresolved_parent_count:
         limitations.append(
             f"부모 프로세스 생성 이벤트가 없거나 안전하게 연결되지 않은 노드가 {unresolved_parent_count}개입니다."
@@ -3153,6 +3313,8 @@ def _intrusion_chain(
         limitations.append(
             f"{pid_parent_link_count}개 부모 연결은 ProcessGuid가 없어 동일 호스트·PID·이미지·시간창으로 보조 연결했습니다. PID 재사용 가능성을 확인해야 합니다."
         )
+    if pid_evidence_link_count:
+        limitations.append(f"의심 이벤트 {pid_evidence_link_count}개는 ProcessGuid 없이 호스트·PID·시간창으로 프로세스에 연결했습니다. PID 재사용 또는 누락된 종료 이벤트 가능성을 확인해야 합니다.")
     if descendant_limit_reached:
         limitations.append(
             f"후속 프로세스는 최대 {INTRUSION_CHAIN_PROCESS_LIMIT}개, 깊이 {INTRUSION_DESCENDANT_DEPTH_LIMIT}단계로 제한했습니다."
@@ -3169,6 +3331,9 @@ def _intrusion_chain(
     source_metadata["followon_record_count_scanned"] = followon_record_count
     source_metadata["followon_group_count"] = len(followon_groups)
     source_metadata["followon_group_limit"] = INTRUSION_FOLLOWON_GROUP_LIMIT
+    source_metadata["file_provenance_link_count"] = len(file_provenance)
+    source_metadata["file_provenance_limit_reached"] = file_link_limit_reached
+    source_metadata["upstream_trace_limit_reached"] = upstream_limit_reached
     truncated = bool(
         process_node_limit_reached
         or suspicious_event_limit_reached
@@ -3177,6 +3342,8 @@ def _intrusion_chain(
         or omitted_step_count
         or not network_scan_complete
         or network_spool_limit_reached
+        or file_link_limit_reached
+        or upstream_limit_reached
     )
     evidence_refs = sorted(
         {
@@ -3195,12 +3362,12 @@ def _intrusion_chain(
         }
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "origin_process_candidate_identified",
         "candidate_only": True,
         "selection_method": (
             "ProcessGuid/부모 계보와 의심 규칙·로컬 명령 신호가 가장 강하게 연결된 "
-            "후보 묶음을 선택한 뒤 그 안의 가장 이른 의심 프로세스를 시작 후보로 지정"
+            "후보 묶음에서 부모 계보와 실행 파일 생성 경위를 역추적해 선행 실행 유발 주체를 우선 지정"
         ),
         "confidence": confidence,
         "confidence_scope": "프로세스 및 이벤트 연결 신뢰도이며 악성 여부 신뢰도가 아닙니다.",
@@ -3211,10 +3378,58 @@ def _intrusion_chain(
                 nodes=nodes,
             ),
             "confirmed": False,
-            "assessment": "현재 증거에서 가장 이른 침해 시작 프로세스 후보이며 악성 여부는 미확정입니다.",
+            "assessment": (
+                "의심 실행을 유발한 선행 프로세스 후보이며 최초 유입 및 악성 파일 여부는 미확정입니다."
+                if origin_key != observed_trigger_key
+                else "현재 최초로 관측된 의심 실행입니다. 이를 유발한 최초 유입 악성 파일은 확인되지 않았습니다."
+            ),
             "basis": origin_basis,
             "parent_context": parent_context,
         },
+        "observed_trigger_process": _intrusion_process_entry(
+            nodes[observed_trigger_key], role="observed_suspicious_execution", nodes=nodes,
+        ),
+        "initiating_process_candidate": (
+            _intrusion_process_entry(origin, role="initiating_process_candidate", nodes=nodes)
+            if origin_key != observed_trigger_key else None
+        ),
+        "origin_assessment": {
+            "status": "upstream_source_candidate_identified" if origin_key != observed_trigger_key else "initial_source_unresolved",
+            "malware_confirmed": False,
+            "initial_compromise_confirmed": False,
+            "candidate_only": True,
+            "assessment": (
+                "부모 계보·파일 생성 경위에서 의심 실행보다 선행한 원인 프로세스 후보를 찾았습니다. 최초 유입과 악성 여부는 미확정입니다."
+                if origin_key != observed_trigger_key
+                else "현재 관측된 의심 실행만 식별했으며 이를 유발한 최초 유입 악성 파일은 확인되지 않았습니다."
+            ),
+            "basis": origin_basis,
+            "missing_evidence": upstream_gaps or ["최초 유입 파일의 내용·다운로드 경위·악성 판정 근거는 제공 로그만으로 확인되지 않았습니다."],
+            "recommended_lookback_before": isoformat_utc(origin.start_time),
+        },
+        "upstream_process_context": [
+            _intrusion_process_entry(nodes[key], role="upstream_context", nodes=nodes)
+            for key in upstream_keys
+        ],
+        "file_provenance": file_provenance,
+        "payload_artifacts": [
+            {
+                "process_instance_id": nodes[key].process_instance_id,
+                "process": nodes[key].process,
+                "referenced_path": path,
+                "reference_kind": "command_line_literal",
+                "source_ref": nodes[key].source_ref,
+                "creation_source_refs": [
+                    ref for link in file_links.get(key, [])
+                    if _intrusion_normalized_file_path(link.get("target_filename")) == _intrusion_normalized_file_path(path)
+                    for ref in link.get("source_refs") or []
+                ],
+                "confirmed": False,
+                "limitation": "정적 경로 인수로 식별한 실행 대상 후보입니다. 실제 로드·스크립트 실행과 악성 여부는 파일 내용/해시 또는 후속 이벤트로 확인해야 합니다.",
+            }
+            for key in relevant_keys
+            for path in _intrusion_literal_payload_paths(nodes[key])
+        ],
         "alternative_origin_candidates": alternatives,
         "component_rule_ids": component_rules,
         "processes": process_entries,
@@ -3266,7 +3481,7 @@ def _intrusion_process_node(event: EventRecord) -> _IntrusionProcessNode | None:
         record_id=event.record_id,
         event_id=event.event_id,
         account=_account(event),
-        command_line=_truncate(_command_line(event), 600),
+        command_line=_truncate(_command_line(event), EVIDENCE_TEXT_CHAR_LIMIT),
         hashes=_truncate(_field(event, "Hashes"), 600),
         parent_process=_parent_process(event),
         parent_process_id=_parent_process_id(event),
@@ -3275,6 +3490,7 @@ def _intrusion_process_node(event: EventRecord) -> _IntrusionProcessNode | None:
         ),
         source_ref=source_ref,
         local_signals=_intrusion_local_process_signals(event),
+        decoded_powershell=_decoded_powershell(event),
     )
 
 
@@ -3320,13 +3536,14 @@ def _intrusion_observed_process_node(
         record_id=record_id,
         event_id=str(event.get("event_id") or "") or None,
         account=str(event.get("account") or "") or None,
-        command_line=_truncate(str(event.get("command_line") or "") or None, 600),
+        command_line=_truncate(str(event.get("command_line") or "") or None, EVIDENCE_TEXT_CHAR_LIMIT),
         hashes=_truncate(str(fields.get("Hashes") or "") or None, 600),
         parent_process=_intrusion_dict_parent_process(event),
         parent_process_id=_intrusion_dict_parent_process_id(event),
         parent_process_guid=_normalized_process_guid(fields.get("ParentProcessGuid")),
         source_ref=_intrusion_source_ref(source_file, record_id, start_time),
         creation_observed=False,
+        decoded_powershell=event.get("decoded_powershell") or {},
     )
 
 
@@ -3375,6 +3592,8 @@ def _intrusion_local_process_signals(event: EventRecord) -> list[str]:
     signals: list[str] = []
     if _event_has_suspicious_command(event):
         signals.append("프로세스 생성 이벤트의 의심 명령줄 패턴")
+    for signal in _decoded_powershell(event).get("signals") or []:
+        signals.append(f"Base64 디코딩 스크립트의 정적 신호: {signal}")
     process_name = _windows_basename(_process(event))
     parent_name = _windows_basename(_parent_process(event))
     if process_name in KNOWN_TUNNEL_CLIENTS:
@@ -3538,6 +3757,194 @@ def _intrusion_suspicious_root(
         current = parent_key
 
 
+def _intrusion_normalized_file_path(value: Any) -> str:
+    path = str(value or "").strip().strip('"').replace("/", "\\")
+    # A basename match is not sufficient evidence of file provenance.
+    return str(PureWindowsPath(path)).casefold() if PureWindowsPath(path).is_absolute() else ""
+
+
+def _intrusion_literal_payload_paths(node: _IntrusionProcessNode) -> list[str]:
+    """Extract literal local payload arguments without interpreting a shell."""
+    name = _windows_basename(node.process)
+    if name not in {"regsvr32.exe", "rundll32.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe"}:
+        return []
+    tokens = re.findall(r'(?:[^\s"]|"[^"]*")+', node.command_line or "")
+    paths: list[str] = []
+    for index, token in enumerate(tokens[1:64], start=1):
+        value = token
+        if name in {"powershell.exe", "pwsh.exe"}:
+            if tokens[index - 1].casefold() not in {"-file", "-f"}:
+                continue
+            extensions = {".ps1"}
+        elif name == "regsvr32.exe":
+            if value.casefold().startswith(("/i:", "-i:")):
+                value = value[3:]
+            extensions = {".dll", ".ocx", ".sct"}
+        elif name == "rundll32.exe":
+            match = re.fullmatch(r'(?:"([^"]+\.dll)"|([^\s",]+\.dll))(?:,[^\s]*)?', value, re.I)
+            if match is None:
+                continue
+            value = match.group(1) or match.group(2)
+            extensions = {".dll"}
+        else:
+            extensions = {".vbs", ".vbe", ".js", ".jse", ".wsf"}
+        value = value.strip('"')
+        if (
+            not re.match(r"^[A-Za-z]:[\\/]", value)
+            or any(marker in value for marker in ('%', '$', '`', '"', '*', '?'))
+            or PureWindowsPath(value).suffix.casefold() not in extensions
+        ):
+            continue
+        if value not in paths:
+            paths.append(value)
+        if len(paths) == 8:
+            break
+    return paths
+
+
+def _intrusion_file_provenance(
+    record_source: Callable[[], Iterator[EventRecord]],
+    nodes: dict[tuple[str, ...], _IntrusionProcessNode],
+    guid_index: dict[tuple[str, str], tuple[str, ...]],
+    pid_index: dict[tuple[str, str], list[tuple[str, ...]]],
+) -> tuple[dict[tuple[str, ...], list[dict[str, Any]]], bool]:
+    """Associate a bounded set of exact-path file writes with later execution.
+
+    This is a provenance hypothesis, not a binary identity or malware verdict.
+    Only the newest observed write before each process creation is retained.
+    """
+    by_image: dict[tuple[str, str], list[tuple[float, tuple[str, ...]]]] = defaultdict(list)
+    for key, node in nodes.items():
+        host = _normalized_host(node.host)
+        if not (host and node.start_time and node.creation_observed):
+            continue
+        paths = {str(node.process or ""), *_intrusion_literal_payload_paths(node)}
+        for value in paths:
+            path = _intrusion_normalized_file_path(value)
+            if path:
+                by_image[(host, path)].append((_as_utc(node.start_time).timestamp(), key))
+    for values in by_image.values():
+        values.sort()
+    matches: dict[tuple[tuple[str, ...], str], dict[str, Any]] = {}
+    truncated = False
+    for event in record_source():
+        if not (
+            _event_id(event) == "11"
+            and _provider(event) == "microsoft-windows-sysmon"
+            and _channel(event) == "microsoft-windows-sysmon/operational"
+            and event.time_created is not None
+        ):
+            continue
+        path = _intrusion_normalized_file_path(_field(event, "TargetFilename"))
+        candidates = by_image.get((_normalized_host(event.computer), path), [])
+        timestamp = _as_utc(event.time_created).timestamp()
+        left = bisect_left(candidates, (timestamp, ()))
+        right = bisect_right(candidates, (timestamp + INTRUSION_FILE_LINK_WINDOW_SECONDS, ("\uffff",)))
+        if right - left > INTRUSION_FILE_MATCHES_PER_PATH_LIMIT:
+            truncated = True
+        creator_key = _intrusion_process_for_event(event, nodes, guid_index, pid_index)
+        if creator_key is not None and (
+            nodes[creator_key].start_time is None
+            or _as_utc(nodes[creator_key].start_time) > _as_utc(event.time_created)
+        ):
+            creator_key = None
+        for _, target_key in candidates[left : min(right, left + INTRUSION_FILE_MATCHES_PER_PATH_LIMIT)]:
+            if creator_key == target_key:
+                continue
+            match_key = (target_key, path)
+            previous = matches.get(match_key)
+            if previous and previous["timestamp"] >= timestamp:
+                continue
+            if match_key not in matches and len(matches) >= INTRUSION_FILE_MATCH_LIMIT:
+                truncated = True
+                continue
+            matches[match_key] = {
+                "creator_key": creator_key,
+                "timestamp": timestamp,
+                "time": isoformat_utc(event.time_created),
+                "target_process_instance_id": nodes[target_key].process_instance_id,
+                "target_filename": _field(event, "TargetFilename"),
+                "target_kind": "executed_image" if path == _intrusion_normalized_file_path(nodes[target_key].process) else "command_referenced_payload",
+                "creator_process": _process(event),
+                "creator_process_id": _process_id(event),
+                "creator_process_guid": _normalized_process_guid(_field(event, "ProcessGuid")),
+                "creator_process_instance_id": nodes[creator_key].process_instance_id if creator_key else None,
+                "creator_link_basis": (
+                    "동일 호스트 ProcessGuid 정확 일치"
+                    if creator_key and _field(event, "ProcessGuid")
+                    else "동일 호스트 PID·이미지·시간창 보조 일치"
+                    if creator_key else "파일 생성 이벤트의 생성자 필드만 관측됨"
+                ),
+                "relationship_basis": "동일 호스트·전체 파일 경로 일치, 실행 전 24시간 이내 가장 최근 파일 생성/덮어쓰기",
+                "confidence": "low",
+                "confirmed": False,
+                "limitation": "파일 생성과 실행 사이의 변경 및 동일 바이너리 여부는 해시/파일 내용 없이 확정할 수 없습니다.",
+                "source_refs": [_intrusion_source_ref(event.source_file, event.record_id, event.time_created)],
+                "sample_evidence": _evidence(event),
+            }
+    grouped: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    for (target_key, _), link in matches.items():
+        grouped[target_key].append(link)
+    return dict(grouped), truncated
+
+
+def _intrusion_upstream_source_candidate(node: _IntrusionProcessNode) -> bool:
+    name = _windows_basename(node.process)
+    normal_context_names = COMMON_NETWORK_CLIENTS | SCRIPT_OR_LOLBIN_NETWORK_CLIENTS | {
+        "explorer.exe", "winword.exe", "excel.exe", "powerpnt.exe", "services.exe",
+        "svchost.exe", "winlogon.exe", "userinit.exe", "smss.exe", "csrss.exe",
+    }
+    # A standard application or shell stays useful context. A user-writable
+    # executable is only a causal source candidate when a path to an already
+    # suspicious descendant exists; its name/path alone never creates a finding.
+    if name in normal_context_names:
+        return False
+    return bool(node.creation_observed and (
+        node.local_signals or node.event_refs or _is_user_writable_process_path(node.process)
+    ))
+
+
+def _intrusion_trace_upstream(
+    trigger_key: tuple[str, ...],
+    nodes: dict[tuple[str, ...], _IntrusionProcessNode],
+    file_links: dict[tuple[str, ...], list[dict[str, Any]]],
+) -> tuple[tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]], list[str], bool]:
+    origin_key = trigger_key
+    context: list[tuple[str, ...]] = []
+    provenance: list[dict[str, Any]] = []
+    gaps: list[str] = []
+    visited: set[tuple[str, ...]] = set()
+    queue = deque([(trigger_key, 0)])
+    truncated = False
+    while queue:
+        key, depth = queue.popleft()
+        if key in visited:
+            continue
+        if depth > INTRUSION_ANCESTOR_DEPTH_LIMIT or len(visited) >= INTRUSION_CHAIN_PROCESS_LIMIT // 2:
+            truncated = True
+            continue
+        visited.add(key)
+        node = nodes[key]
+        if key != trigger_key:
+            context.append(key)
+            if _intrusion_upstream_source_candidate(node) and (
+                _intrusion_node_sort_key(node) < _intrusion_node_sort_key(nodes[origin_key])
+            ):
+                origin_key = key
+        if node.parent_key in nodes:
+            queue.append((node.parent_key, depth + 1))
+        elif node.parent_process or node.parent_process_guid or node.parent_process_id:
+            gaps.append(f"{node.process or node.process_instance_id} 이전 부모 생성 이벤트가 없어 더 이른 유입 주체를 확인할 수 없습니다.")
+        for link in file_links.get(key, []):
+            provenance.append({name: value for name, value in link.items() if name not in {"creator_key", "timestamp"}})
+            creator_key = link.get("creator_key")
+            if creator_key in nodes:
+                queue.append((creator_key, depth + 1))
+            else:
+                gaps.append(f"{link.get('target_filename')} 파일 생성자의 프로세스 생성 이벤트가 없습니다.")
+    return origin_key, context, provenance, list(dict.fromkeys(gaps))[:16], truncated
+
+
 def _intrusion_candidate_score(
     origin: _IntrusionProcessNode,
     member_keys: list[tuple[str, ...]],
@@ -3661,7 +4068,7 @@ def _intrusion_process_for_event(
     guid = _normalized_process_guid(_field(event, "ProcessGuid"))
     if guid:
         return guid_index.get((host, guid))
-    pid = _normalized_process_id(_field(event, "ProcessId", "ProcessID"))
+    pid = _process_id(event)
     if not pid:
         return None
     return _intrusion_pid_candidate(
@@ -3778,6 +4185,7 @@ def _intrusion_process_entry(
         "process_id": node.process_id,
         "process_guid": node.process_guid,
         "command_line": node.command_line,
+        "decoded_powershell": node.decoded_powershell,
         "account": node.account,
         "hashes": node.hashes,
         "creation_event_observed": node.creation_observed,
@@ -3798,12 +4206,16 @@ def _intrusion_process_step(
     *,
     origin: bool,
     suspicious: bool,
+    upstream_context: bool = False,
     nodes: dict[tuple[str, ...], _IntrusionProcessNode],
 ) -> dict[str, Any]:
     parent = nodes.get(node.parent_key) if node.parent_key else None
     if origin:
-        assessment = "가장 이른 침해 시작 프로세스 후보; 악성 여부 미확정"
+        assessment = "침해 실행 유발 주체 또는 최초 관측 의심 실행 후보; 최초 유입·악성 여부 미확정"
         event_kind = "origin_process_candidate"
+    elif upstream_context:
+        assessment = "부모 계보/파일 생성 경위에서 관측된 선행 프로세스 문맥; 악성 판정 아님"
+        event_kind = "upstream_process_context"
     elif suspicious:
         assessment = "시작 후보의 후속 프로세스이며 의심 규칙 또는 로컬 실행 신호와 연결됨"
         event_kind = "suspicious_child_process"
@@ -3813,7 +4225,7 @@ def _intrusion_process_step(
     return {
         "time": isoformat_utc(node.start_time),
         "event_kind": event_kind,
-        "phase": "침해 시작 후보" if origin else "후속 프로세스 실행",
+        "phase": "침해 시작 후보" if origin else "선행 실행 문맥" if upstream_context else "후속 프로세스 실행",
         "assessment": assessment,
         "process_instance_id": node.process_instance_id,
         "parent_process_instance_id": parent.process_instance_id if parent else None,
@@ -3823,6 +4235,7 @@ def _intrusion_process_step(
         "process_id": node.process_id,
         "process_guid": node.process_guid,
         "command_line": node.command_line,
+        "decoded_powershell": node.decoded_powershell,
         "parent_process": node.parent_process,
         "event_id": node.event_id,
         "event_count": 1,
@@ -3847,10 +4260,16 @@ def _intrusion_suspicious_step(
         "assessment": "; ".join(titles[:3]) or "규칙 기반 의심 활동",
         "process_instance_id": node.process_instance_id,
         "host": event.get("host"),
-        "process": event.get("process"),
+        "process": event.get("process") or node.process,
         "process_id": event.get("process_id"),
         "process_guid": event.get("process_guid"),
         "command_line": event.get("command_line"),
+        "decoded_powershell": event.get("decoded_powershell") or {},
+        "relationship_basis": (
+            "동일 호스트 PowerShell System/Execution PID와 프로세스 생성 시간창 보조 연결; PID 재사용 확인 필요"
+            if event.get("execution_process_id") and str(event.get("event_id") or "") in {"4103", "4104"}
+            else None
+        ),
         "event_id": event.get("event_id"),
         "event_count": 1,
         "event_refs": [event["event_ref"]] if event.get("event_ref") else [],
@@ -4699,6 +5118,11 @@ def _finding(
             _record_sort_key(event.record_id),
         ),
     )
+    record_finding_evidence(
+        ordered, rule_id=rule_id, title=title, severity=severity,
+        confidence=confidence, description=description,
+        evidence_factory=_evidence, event_count=event_count,
+    )
     timed_events = [event for event in ordered if event.time_created is not None]
     first_seen = timed_events[0].time_created if timed_events else None
     last_seen = timed_events[-1].time_created if timed_events else None
@@ -4890,6 +5314,18 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
             "ServiceName",
             "ServiceFileName",
             "TaskName",
+            "TaskContent",
+            "TargetObject",
+            "Details",
+            "EventType",
+            "ImageLoaded",
+            "Signature",
+            "SignatureStatus",
+            "Signed",
+            "Company",
+            "Description",
+            "StartModule",
+            "StartFunction",
             "ObjectName",
             "ObjectValueName",
             "Operation",
@@ -4919,6 +5355,13 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
             "New Value",
             "Setting",
             "ScriptBlockText",
+            "ScriptBlock",
+            "Payload",
+            "TargetFilename",
+            "CreationUtcTime",
+            "ScriptBlockId",
+            "MessageNumber",
+            "MessageTotal",
         }
     }
     return {
@@ -4939,14 +5382,20 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
         "initiated": _normalized_boolean(_field(event, "Initiated")),
         "process": _process(event),
         "process_id": _process_id(event),
+        "execution_process_id": event.execution_process_id,
         "process_guid": _normalized_process_guid(_field(event, "ProcessGuid")),
         "query_name": _field(event, "QueryName"),
         "network_direction": _network_direction(
             event,
             _normalized_boolean(_field(event, "Initiated")),
         ),
-        "command_line": _truncate(_command_line(event), 600),
-        "fields": {key: _truncate(value, 600) for key, value in selected_fields.items()},
+        "command_line": _truncate(_command_line(event), EVIDENCE_TEXT_CHAR_LIMIT),
+        "decoded_powershell": _decoded_powershell(event),
+        "fields": {key: _truncate(value, EVIDENCE_TEXT_CHAR_LIMIT) for key, value in selected_fields.items()},
+        "text_truncated_fields": [
+            key for key, value in selected_fields.items()
+            if len(value) > EVIDENCE_TEXT_CHAR_LIMIT
+        ],
     }
 
 
@@ -5049,7 +5498,9 @@ def _is_event_log_clear_event(event: EventRecord) -> bool:
         and _is_process_creation_event(event)
     ):
         return True
-    if event_id == "1102" and _is_security_event(event):
+    if event_id == "1102" and channel == "security" and provider in {
+        "microsoft-windows-eventlog", "microsoft-windows-security-auditing",
+    }:
         return True
     return (
         event_id == "104"
@@ -5217,6 +5668,10 @@ def _process_id(event: EventRecord) -> str | None:
     if _event_id(event) == "4688" and _is_security_event(event):
         return _normalized_process_id(
             _field(event, "NewProcessId", "ProcessID", "ProcessId")
+        )
+    if _is_powershell_event(event):
+        return _normalized_process_id(
+            _field(event, "ProcessId", "ProcessID") or event.execution_process_id
         )
     return _normalized_process_id(
         _field(event, "ProcessId", "ProcessID", "NewProcessId")

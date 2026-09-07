@@ -24,6 +24,7 @@ class EventRecord:
     event_data: dict[str, str] = field(default_factory=dict)
     user_data: dict[str, str] = field(default_factory=dict)
     raw_xml: str = ""
+    execution_process_id: str | None = None
 
     def to_dict(self, include_raw: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -40,6 +41,7 @@ class EventRecord:
             "keywords": self.keywords,
             "event_data": self.event_data,
             "user_data": self.user_data,
+            "execution_process_id": self.execution_process_id,
         }
         if include_raw:
             data["raw_xml"] = self.raw_xml
@@ -58,6 +60,7 @@ class EventRecord:
             computer=_optional_text(value.get("computer")),
             time_created=parse_event_time(_optional_text(value.get("time_created"))),
             record_id=_optional_text(value.get("record_id")),
+            execution_process_id=_optional_text(value.get("execution_process_id")),
             level=_optional_text(value.get("level")),
             task=_optional_text(value.get("task")),
             opcode=_optional_text(value.get("opcode")),
