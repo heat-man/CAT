@@ -11,9 +11,6 @@ const summaryView = document.querySelector("#summaryView");
 const savePdfButton = document.querySelector("#savePdfButton");
 const tabList = document.querySelector(".tab-list");
 const healthStatus = document.querySelector("#healthStatus");
-const agentBackend = document.querySelector("#agentBackend");
-const lmUrl = document.querySelector("#lmUrl");
-const lmModel = document.querySelector("#lmModel");
 const progressFill = document.querySelector("#progressFill");
 const progressCat = document.querySelector("#progressCat");
 const loadingText = document.querySelector("#loadingText");
@@ -21,7 +18,6 @@ const catSelector = document.querySelector("#catSelector");
 const mainCatImage = document.querySelector("#mainCatImage");
 const previousCatButton = document.querySelector("#previousCatButton");
 const nextCatButton = document.querySelector("#nextCatButton");
-const autoExpandTimeRange = document.querySelector('input[name="auto_expand_time_range"]');
 const historyButton = document.querySelector("#historyButton");
 const historyDialog = document.querySelector("#historyDialog");
 const historyList = document.querySelector("#historyList");
@@ -29,19 +25,12 @@ const historyStorageStatus = document.querySelector("#historyStorageStatus");
 const closeHistoryButton = document.querySelector("#closeHistoryButton");
 const clearHistoryButton = document.querySelector("#clearHistoryButton");
 
-const LM_URL_PREFERENCE_KEY = "cat.lm_url";
-const LM_URL_DEFAULT_MIGRATION_KEY = "cat.lm_url_default_migration_v2";
 const ANALYSIS_HISTORY_KEY = "cat.analysis_history.v1";
 const ANALYSIS_HISTORY_MAX_ENTRIES = 10;
 const ANALYSIS_HISTORY_MAX_TOTAL_CHARS = 1500000;
 const ANALYSIS_HISTORY_MAX_ENTRY_CHARS = 350000;
 const ANALYSIS_HISTORY_MAX_REPORT_CHARS = 180000;
 const HISTORY_FORBIDDEN_KEYS = /(?:^|_)(?:api_?key|private_?key|authorization|token|access_?token|refresh_?token|auth_?token|bearer_?token|id_?token|session_?token|cookie|password|secret|credential|raw(?:_xml)?|file_content|uploaded_file_content)(?:_|$)/i;
-const LEGACY_LM_STUDIO_DEFAULTS = new Set([
-  "http://127.0.0.1:1234",
-  "http://127.0.0.1:1234/v1",
-  "http://127.0.0.1:1234/v1/chat/completions",
-]);
 
 const C2_SCORE_COMPONENT_LABELS = Object.freeze({
   high_risk_port: "고위험 목적지 포트",
@@ -65,6 +54,11 @@ const NETWORK_FINDING_RULE_IDS = new Set([
 ]);
 
 const CAT_IMAGES = Object.freeze([
+  {
+    id: "cat_staring.jpg",
+    src: "/asset/cat_staring.jpg",
+    alt: "이불 속에서 카메라를 바라보는 회색 고양이",
+  },
   {
     id: "cat.jpg",
     src: "/asset/cat.jpg",
@@ -104,67 +98,14 @@ async function loadHealth() {
     const response = await fetch("/api/health");
     const data = await response.json();
     healthStatus.textContent = data.ok ? "서버 연결됨" : "서버 오류";
+    healthStatus.dataset.state = data.ok ? "online" : "offline";
     if (data.max_upload_bytes) {
       maxUploadBytes = data.max_upload_bytes;
     }
-    configureAgentBackends(data);
-    if (data.lm_studio_url && lmUrl) {
-      lmUrl.value = data.allow_custom_lm_url === true
-        ? preferredLmUrl(data.lm_studio_url)
-        : data.lm_studio_url;
-    }
-    if (lmUrl) {
-      lmUrl.readOnly = data.allow_custom_lm_url !== true;
-      lmUrl.title = lmUrl.readOnly
-        ? "운영 모드에서는 서버 환경변수 LM_STUDIO_URL 값을 사용합니다."
-        : "base URL, /v1 또는 전체 chat/completions 주소를 입력할 수 있습니다.";
-    }
-    if (data.default_model && lmModel) {
-      lmModel.value = readPreference("cat.lm_model") || data.default_model;
-    }
-    if (autoExpandTimeRange && typeof data.adaptive_time_range?.default_enabled === "boolean") {
-      autoExpandTimeRange.checked = data.adaptive_time_range.default_enabled;
-    }
-    updateAgentFields();
   } catch {
     healthStatus.textContent = "서버 연결 실패";
+    healthStatus.dataset.state = "offline";
   }
-}
-
-function configureAgentBackends(data) {
-  if (!agentBackend) return;
-  const supported = new Set(["lmstudio", "rule"]);
-  if (data.codex_dev_enabled === true) {
-    supported.add("codex_dev");
-  }
-  const labels = {
-    lmstudio: "LM Studio Qwen",
-    codex_dev: "Codex 개발 검증",
-    rule: "규칙 기반 보고서",
-  };
-
-  for (const option of [...agentBackend.options]) {
-    if (!supported.has(option.value)) {
-      option.remove();
-    }
-  }
-  for (const backend of ["lmstudio", "codex_dev", "rule"]) {
-    if (supported.has(backend) && !agentBackend.querySelector(`option[value="${backend}"]`)) {
-      const option = document.createElement("option");
-      option.value = backend;
-      option.textContent = labels[backend];
-      agentBackend.append(option);
-    }
-  }
-  if (supported.has(data.default_agent_backend)) {
-    agentBackend.value = data.default_agent_backend;
-  }
-}
-
-function updateAgentFields() {
-  const isLmStudio = agentBackend?.value === "lmstudio";
-  if (lmUrl) lmUrl.disabled = !isLmStudio;
-  if (lmModel) lmModel.disabled = !isLmStudio;
 }
 
 function updateFileSummary() {
@@ -230,10 +171,12 @@ form.addEventListener("submit", async (event) => {
   }
 
   const formData = new FormData(form);
-  formData.set(
-    "auto_expand_time_range",
-    autoExpandTimeRange?.checked === true ? "true" : "false",
-  );
+  // The web app uses the server's configured backend, endpoint and model.
+  // Discard legacy fields instead of reviving older browser preferences.
+  for (const key of ["agent_backend", "lm_url", "lm_model", "use_llm"]) {
+    formData.delete(key);
+  }
+  formData.set("auto_expand_time_range", "true");
   formData.delete("files");
   for (const file of selectedFiles) {
     formData.append("files", file);
@@ -289,9 +232,6 @@ form.addEventListener("submit", async (event) => {
 });
 
 fileInput.addEventListener("change", updateFileSummary);
-agentBackend?.addEventListener("change", updateAgentFields);
-lmUrl?.addEventListener("change", () => writePreference(LM_URL_PREFERENCE_KEY, lmUrl.value.trim()));
-lmModel?.addEventListener("change", () => writePreference("cat.lm_model", lmModel.value.trim()));
 savePdfButton?.addEventListener("click", saveReportAsPdf);
 historyButton?.addEventListener("click", openAnalysisHistory);
 closeHistoryButton?.addEventListener("click", closeAnalysisHistory);
@@ -789,6 +729,14 @@ function minimalHistoryAnalysis(analysis) {
         upstream_process_context: asList(chain.upstream_process_context).slice(0, 8),
         file_provenance: asList(chain.file_provenance).slice(0, 8),
         payload_artifacts: asList(chain.payload_artifacts).slice(0, 8),
+        related_events: asList(chain.related_events).slice(0, 8),
+        related_event_scope: {
+          ...chain.related_event_scope,
+          included_event_count: Math.min(asList(chain.related_events).length, 8),
+          omitted_event_count: (Number(chain.related_event_scope?.omitted_event_count) || 0)
+            + Math.max(0, asList(chain.related_events).length - 8),
+          truncated: chain.related_event_scope?.truncated === true || asList(chain.related_events).length > 8,
+        },
         steps: asList(chain.steps).slice(0, 8),
         truncated: chain.truncated === true || asList(chain.steps).length > 8,
         chain_truncated: chain.chain_truncated === true || asList(chain.steps).length > 8,
@@ -1066,23 +1014,16 @@ function clearAnalysisHistory() {
   renderAnalysisHistory();
 }
 
-function preferredLmUrl(serverDefault) {
-  const saved = readPreference(LM_URL_PREFERENCE_KEY).trim();
-  const migrationDone = readPreference(LM_URL_DEFAULT_MIGRATION_KEY) === "done";
-  if (!migrationDone) {
-    writePreference(LM_URL_DEFAULT_MIGRATION_KEY, "done");
-    const comparable = saved.replace(/\/+$/, "");
-    if (saved && LEGACY_LM_STUDIO_DEFAULTS.has(comparable)) {
-      writePreference(LM_URL_PREFERENCE_KEY, "");
-      return serverDefault;
-    }
-  }
-  return saved || serverDefault;
-}
-
 function initializeCatSelector() {
   if (!mainCatImage || !CAT_IMAGES.length) return;
-  const preferredId = readPreference("cat.main_image");
+  let preferredId = readPreference("cat.main_image");
+  // Reset earlier saved photos once so the requested new main image is visible.
+  // Choices made with the carousel after this migration still persist normally.
+  if (!readPreference("cat.main_image_staring_default_v2")) {
+    preferredId = "cat_staring.jpg";
+    writePreference("cat.main_image", preferredId);
+    writePreference("cat.main_image_staring_default_v2", "done");
+  }
   const preferredIndex = CAT_IMAGES.findIndex((item) => item.id === preferredId);
   currentCatImageIndex = preferredIndex >= 0 ? preferredIndex : 0;
   renderCatImage();
@@ -1108,6 +1049,67 @@ function handleCatSelectorKeydown(event) {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
   selectCatImage(event.key === "ArrowLeft" ? -1 : 1);
+}
+
+function initializeCatCursor() {
+  const cursor = document.querySelector("#catCursor");
+  const cursorImage = document.querySelector("#catCursorImage");
+  if (!cursor || !cursorImage || typeof window.matchMedia !== "function") return;
+  const pointerMode = window.matchMedia("(hover: hover) and (pointer: fine)");
+  const motionMode = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let imageReady = cursorImage.complete && cursorImage.naturalWidth > 0;
+  let frame = 0;
+  let pointerX = 0;
+  let pointerY = 0;
+
+  const hide = () => {
+    if (frame) window.cancelAnimationFrame(frame);
+    frame = 0;
+    cursor.hidden = true;
+    cursor.classList.remove("is-pressed");
+    document.documentElement.classList.remove("cat-cursor-active");
+  };
+  const draw = () => {
+    frame = 0;
+    if (!imageReady || !pointerMode.matches || motionMode.matches || document.hidden) {
+      hide();
+      return;
+    }
+    // Keep the raised paw near the actual click point in both sprite halves.
+    cursor.style.transform = `translate3d(${pointerX}px, ${pointerY}px, 0) translate(-25%, -12%)`;
+    cursor.hidden = false;
+    document.documentElement.classList.add("cat-cursor-active");
+  };
+  const move = (event, pressed = event.buttons > 0) => {
+    if (event.pointerType !== "mouse" || !imageReady || !pointerMode.matches || motionMode.matches) {
+      hide();
+      return;
+    }
+    // A modal dialog lives above ordinary z-index layers. Keep the cursor in its layer.
+    const container = event.target?.closest?.("dialog[open]") || document.body;
+    if (cursor.parentElement !== container) container.append(cursor);
+    cursor.classList.toggle("is-pressed", pressed);
+    pointerX = event.clientX;
+    pointerY = event.clientY;
+    if (!frame) frame = window.requestAnimationFrame(draw);
+  };
+  cursorImage.addEventListener("load", () => { imageReady = cursorImage.naturalWidth > 0; });
+  cursorImage.addEventListener("error", () => { imageReady = false; hide(); });
+  document.addEventListener("pointermove", move, { passive: true });
+  // Capture also observes presses/releases on controls that stop propagation.
+  document.addEventListener("pointerdown", (event) => move(event, true), { passive: true, capture: true });
+  document.addEventListener("pointerup", (event) => move(event), { passive: true, capture: true });
+  document.documentElement.addEventListener("pointerleave", hide);
+  document.addEventListener("pointercancel", hide);
+  document.addEventListener("lostpointercapture", hide);
+  document.addEventListener("dragstart", hide);
+  document.addEventListener("visibilitychange", hide);
+  document.addEventListener("close", hide, true);
+  document.addEventListener("keydown", (event) => { if (event.key === "Tab") hide(); });
+  window.addEventListener("blur", hide);
+  window.addEventListener("beforeprint", hide);
+  pointerMode.addEventListener?.("change", hide);
+  motionMode.addEventListener?.("change", hide);
 }
 
 function resolveAnalysisPayload(data) {
@@ -1190,10 +1192,11 @@ function renderIntrusionChain(chain) {
   const limitations = uniqueText(asList(chain.limitations));
   const status = escapeHtml(chain.status || "근거 부족");
   if (!origin) {
-    return `<section class="intrusion-chain" aria-label="최초 침해 프로세스와 후속 흐름">
-      <h2>최초 침해 프로세스와 후속 흐름</h2>
+    return `<section class="intrusion-chain" aria-label="침해 시발점 프로세스 추적">
+      <h2>침해 시발점 프로세스 추적</h2>
       <p><strong>식별 상태:</strong> ${status}</p>
       <p>현재 EVTX/XML 근거만으로 시작 프로세스를 안전하게 식별하지 못했습니다.</p>
+      ${renderOriginReviewLogs(chain)}
       ${renderValueList("분석 한계", limitations.slice(0, 6))}
     </section>`;
   }
@@ -1243,20 +1246,66 @@ function renderIntrusionChain(chain) {
       <td>${evidenceRefs.length ? evidenceRefs.map(escapeHtml).join("<br>") : "-"}</td>
     </tr>`;
   }).join("");
-  return `<section class="intrusion-chain" aria-label="최초 침해 프로세스와 후속 흐름">
-    <h2>최초 침해 프로세스와 후속 흐름</h2>
+  return `<section class="intrusion-chain" aria-label="침해 시발점 프로세스 추적">
+    <h2>침해 시발점 프로세스 추적</h2>
     <p><strong>판정:</strong> 침해 확정이 아닌 시작 프로세스 후보 · 연결 신뢰도 ${escapeHtml(chain.confidence || "unknown")}</p>
     <p><strong>시작 후보:</strong> ${originDetails.length ? originDetails.map(escapeHtml).join(" / ") : "확인 불가"}</p>
     ${origin.command_line ? `<p><strong>명령줄:</strong> <code>${escapeHtml(origin.command_line)}</code></p>` : ""}
     ${renderOriginInvestigation(chain)}
     ${renderDecodedPowershell(origin.decoded_powershell)}
     ${parentDetails.length ? `<p><strong>부모 문맥:</strong> ${parentDetails.map(escapeHtml).join(" / ")}</p>` : ""}
+    ${renderOriginReviewLogs(chain)}
+    ${stepRows ? "<h3>연결된 후속 행위</h3>" : ""}
     ${stepRows ? `<table class="evidence-table intrusion-chain-table">
       <thead><tr><th>순서</th><th>시간</th><th>단계</th><th>프로세스</th><th>행위·목적지</th><th>근거</th></tr></thead>
       <tbody>${stepRows}</tbody>
     </table>` : "<p>표시할 후속 단계가 없습니다.</p>"}
     ${chain.truncated === true ? '<p class="scope-note"><strong>범위 주의:</strong> 상한에 맞춘 대표 체인입니다.</p>' : ""}
     ${renderValueList("체인 분석 한계", limitations)}
+  </section>`;
+}
+
+function renderOriginReviewLogs(chain) {
+  const events = asList(chain.related_events).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const scope = chain.related_event_scope || {};
+  if (!events.length && !scope.truncated) return "";
+  const rows = events.map((item) => {
+    const refs = uniqueText([
+      item.source_ref,
+      ...asList(item.source_refs),
+      ...asList(item.event_refs),
+      item.source_file ? `${item.source_file}${item.record_id != null ? `#${item.record_id}` : ""}` : "",
+    ]);
+    const fields = item.fields && typeof item.fields === "object" && !Array.isArray(item.fields)
+      ? Object.entries(item.fields).map(([name, value]) => `${name}: ${displayValue(value)}`).join("\n")
+      : "";
+    const details = uniqueText([
+      eventValue(item, "process", "Image", "NewProcessName", "Application"),
+      eventValue(item, "command_line", "CommandLine"),
+      fields,
+    ]).join("\n");
+    return `<tr>
+      <td>${renderMultilineCell([
+        item.review_reason || "원인 프로세스와 연결된 로그",
+        item.relationship_basis,
+      ])}</td>
+      <td>${renderMultilineCell([
+        item.time || "시간 불명", `Event ID ${item.event_id ?? "미상"}`, item.host, item.provider, item.channel, ...refs,
+      ])}</td>
+      <td><pre><code>${escapeHtml(details || "상세 필드 없음")}</code></pre>
+        ${renderDecodedPowershell(item.decoded_powershell)}
+        ${asList(item.text_truncated_fields).length ? `<p class="scope-note">원문 필드 일부 생략: ${renderMultilineCell(item.text_truncated_fields)}</p>` : ""}
+      </td>
+    </tr>`;
+  }).join("");
+  return `<section class="origin-review" aria-label="분석관 우선 검토 로그">
+    <h3>분석관 우선 검토 로그</h3>
+    <p>침해 시발점과의 연결 근거를 검토할 수 있도록 관련 레코드와 원본 위치를 제공합니다.</p>
+    ${rows ? `<table class="evidence-table"><thead><tr><th>검토 이유·연결 근거</th><th>시간·원본 로그</th><th>프로세스·명령·이벤트 필드</th></tr></thead><tbody>${rows}</tbody></table>` : ""}
+    ${scope.truncated ? `<p class="scope-note">보존 상한으로 관련 로그 ${escapeHtml(scope.omitted_event_count ?? "일부")}건이 생략되었습니다.</p>` : ""}
+    ${renderValueList("관련 로그 보존 한계", scope.limitations)}
   </section>`;
 }
 
@@ -1589,6 +1638,7 @@ function collectPrintEvidenceLimitations(analysis, llm) {
     ...asList(analysis.evidence_limitations).map(formatEvidenceLimitation),
     ...asList(analysis.report_evidence_scope?.limitations).map(formatEvidenceLimitation),
     ...asList(intrusionChain.limitations).map(formatEvidenceLimitation),
+    ...asList(intrusionChain.related_event_scope?.limitations).map(formatEvidenceLimitation),
     ...asList(parser.errors),
     ...asList(llm?.hierarchical_validation_warnings),
     ...asList(llm?.validation_warnings),
@@ -2075,9 +2125,9 @@ function renderSummaryContents(analysis, includeParserWarning = true) {
   const scope = analysis.scope || {};
   const parserWarning = includeParserWarning ? renderParserWarning(analysis) : "";
   return `${parserWarning}<div class="summary-grid">
+    ${renderIntrusionChainSummary(analysis.intrusion_chain)}
     ${renderScope(scope)}
     ${renderAdaptiveTimeRange(analysis.adaptive_time_range)}
-    ${renderIntrusionChainSummary(analysis.intrusion_chain)}
     ${renderNetworkActivity(analysis.network_activity)}
     ${renderCounter("이벤트 ID", summary.top_event_ids)}
     ${renderCounter("호스트", summary.top_hosts)}
@@ -2104,14 +2154,15 @@ function renderIntrusionChainSummary(chain) {
     ["PID", origin?.process_id],
     ["ProcessGuid", origin?.process_guid],
     ["후속 프로세스", countLabel(asList(chain.processes).length)],
-    ["시간순 단계", countLabel(asList(chain.steps).length)],
+    ["연관 행위 근거", countLabel(asList(chain.steps).length)],
+    ["우선 검토 로그", countLabel(asList(chain.related_events).length)],
     ["대표 체인 여부", chain.truncated === true ? "상한에 맞춘 대표 체인" : "기록된 범위 내 전체 체인"],
   ]
     .filter(([, value]) => value !== undefined && value !== null && value !== "")
     .map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(value)}</td></tr>`)
     .join("");
-  return `<section class="summary-block">
-    <h3>최초 침해 프로세스 후보</h3>
+  return `<section class="summary-block origin-focus">
+    <h3>침해 시발점 프로세스 · 최우선 조사 대상</h3>
     <table><tbody>${rows}</tbody></table>
   </section>`;
 }
@@ -2132,12 +2183,26 @@ function renderAdaptiveTimeRange(adaptiveRange) {
     adaptiveRange.effective_end_utc || "종료 미지정",
   ].join(" ~ ");
   const appliedRange = applied ? effectiveRange : requestedRange;
+  const stopReasons = {
+    disabled: "자동 분석 사용 안 함",
+    no_supported_expansion: "추가 확장을 뒷받침하는 근거 없음",
+    no_earlier_uploaded_logs: "업로드한 로그에 더 이른 기록이 없음",
+    max_lookback: "이전 시간대 탐색 한도 도달",
+    max_rounds: "추가 분석 횟수 한도 도달",
+    time_budget: "추가 분석 시간 한도 도달",
+    incident_focus_unavailable: "기존 침해 후보 연결 근거 부족으로 마지막 결과 유지",
+    parser_or_retention_limit: "파싱 또는 로그 보존 한도로 분석 중지",
+    expansion_error: "추가 분석 오류로 마지막 결과 유지",
+  };
   const rows = [
     ["자동 확장", enabled ? "사용" : "사용 안 함"],
     ["확장 적용", applied ? "적용됨" : "적용되지 않음"],
     ["요청 범위", requestedRange],
     ["평가된 확장 범위", effectiveRange],
     ["실제 적용 범위", appliedRange],
+    ["추가 분석 완료", adaptiveRange.rounds_completed != null ? `${Number(adaptiveRange.rounds_completed).toLocaleString()}회` : null],
+    ["추가 분석 종료 이유", adaptiveRange.stop_reason ? stopReasons[adaptiveRange.stop_reason] || "추가 분석 완료" : null],
+    ["추가 확인이 필요한 근거", Array.isArray(adaptiveRange.missing_evidence) ? countLabel(adaptiveRange.missing_evidence.length) : null],
     ["시작 전 가용 이벤트", countLabel(adaptiveRange.available_events_before_requested_range)],
     ["종료 후 가용 이벤트", countLabel(adaptiveRange.available_events_after_requested_range)],
   ]
@@ -2150,10 +2215,22 @@ function renderAdaptiveTimeRange(adaptiveRange) {
   const errorHtml = adaptiveRange.expansion_error
     ? `<p><strong>확장 경고:</strong> ${escapeHtml(adaptiveRange.expansion_error)}</p>`
     : "";
+  const rounds = asList(adaptiveRange.rounds).filter(
+    (item) => item && typeof item === "object" && !Array.isArray(item),
+  );
+  const roundHtml = rounds.length ? `<details><summary>추가 분석 구간 확인</summary>
+    <table><thead><tr><th>차수·결과</th><th>검토 범위 (UTC)</th><th>검토 이유</th></tr></thead><tbody>
+    ${rounds.map((item) => `<tr>
+      <td>${escapeHtml(item.round ?? "-")}차 · ${item.applied === true ? "적용" : "미적용"}</td>
+      <td>${renderMultilineCell([item.start_utc || "시작 미지정", item.end_utc || "종료 미지정"])}</td>
+      <td>${renderMultilineCell([...asList(item.reasons), item.error])}</td>
+    </tr>`).join("")}
+    </tbody></table></details>` : "";
   return `<section class="summary-block">
     <h3>자율 분석 시간 범위</h3>
     <table><tbody>${rows}</tbody></table>
-    ${reasonHtml}${errorHtml}
+    ${reasonHtml}${roundHtml}${errorHtml}
+    ${adaptiveRange.coverage_note ? `<p class="scope-note">${escapeHtml(adaptiveRange.coverage_note)}</p>` : ""}
   </section>`;
 }
 
@@ -2408,5 +2485,6 @@ function updateProgress(percent, message) {
 }
 
 initializeCatSelector();
+initializeCatCursor();
 renderAnalysisHistory();
 loadHealth();

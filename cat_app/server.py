@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from email import policy
 from email.parser import BytesParser
+from datetime import datetime
 import argparse
 import ipaddress
 import json
@@ -22,12 +23,19 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .adaptive_range import (
+    AdaptiveRangeDecision,
+    DEFAULT_AUTO_EXPAND_BUDGET_SECONDS,
     DEFAULT_AUTO_EXPAND_EDGE_SECONDS,
+    DEFAULT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS,
+    DEFAULT_AUTO_EXPAND_MAX_ROUNDS,
     DEFAULT_AUTO_EXPAND_WINDOW_SECONDS,
+    incident_focus_anchors,
     recommend_expanded_range,
+    root_trace_gaps,
 )
 from .analyzer import analyze_events
 from .evtx_reader import XML_PARSE_TIMEOUT_SECONDS, parse_event_files
+from .models import ParseResult
 from .report_evidence import REPORT_EVIDENCE_MAX_CHARS, REPORT_EVIDENCE_MAX_EVENTS
 from .reporting import (
     DEFAULT_LM_MAX_FIELD_CHARS,
@@ -115,6 +123,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
 CAT_IMAGE_ROOT = PROJECT_ROOT / "images"
 CAT_IMAGE_ASSETS = {
+    "/asset/cat_staring.jpg": CAT_IMAGE_ROOT / "cat_staring.jpg",
     "/asset/cat.jpg": CAT_IMAGE_ROOT / "cat.jpg",
     "/asset/cat_down.jpg": CAT_IMAGE_ROOT / "cat_down.jpg",
     "/asset/cat_dress.jpg": CAT_IMAGE_ROOT / "cat_dress.jpg",
@@ -303,6 +312,9 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                         "default_enabled": DEFAULT_AUTO_EXPAND_TIME_RANGE,
                         "edge_seconds": DEFAULT_AUTO_EXPAND_EDGE_SECONDS,
                         "window_seconds": DEFAULT_AUTO_EXPAND_WINDOW_SECONDS,
+                        "max_rounds": DEFAULT_AUTO_EXPAND_MAX_ROUNDS,
+                        "max_lookback_seconds": DEFAULT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS,
+                        "budget_seconds": DEFAULT_AUTO_EXPAND_BUDGET_SECONDS,
                     },
                     "http_header_timeout_seconds": DEFAULT_HTTP_HEADER_TIMEOUT_SECONDS,
                     "response_write_timeout_seconds": DEFAULT_RESPONSE_WRITE_TIMEOUT_SECONDS,
@@ -315,7 +327,10 @@ class CATRequestHandler(BaseHTTPRequestHandler):
         if asset_path is not None:
             self._serve_static(asset_path)
             return
-        if self.path.split("?", 1)[0] in {"/asset/nyan_cat.gif", "/asset/nyan-cat.gif"}:
+        if self.path.split("?", 1)[0] == "/asset/cat_cursor.png":
+            self._serve_static(CAT_IMAGE_ROOT / "cat_cursor.png")
+            return
+        if self.path.split("?", 1)[0] in {"/asset/nyancat.gif", "/asset/nyan_cat.gif", "/asset/nyan-cat.gif"}:
             self._serve_static(_existing_asset("nyan_cat.gif", "nyan-cat.gif"))
             return
         if self.path.startswith("/static/"):
@@ -456,82 +471,20 @@ class CATRequestHandler(BaseHTTPRequestHandler):
                 return
 
             analysis = analyze_events(parse_result, start_utc, end_utc)
-            range_decision = recommend_expanded_range(
-                analysis,
-                parse_result,
-                start_utc,
-                end_utc,
-                enabled=auto_expand_time_range,
-            )
-            adaptive_range_metadata = range_decision.metadata(
-                enabled=auto_expand_time_range,
-                requested_start_utc=start_utc,
-                requested_end_utc=end_utc,
-                parse_result=parse_result,
-            )
-            adaptive_range_metadata["applied"] = False
-            if range_decision.expanded:
-                initial_analysis = analysis
-                initial_parser = parse_result.to_dict()
-                adaptive_range_metadata["initial_parser"] = initial_parser
-                parse_result.close()
+            try:
+                analysis = _expand_analysis_context(
+                    analysis, parse_result, saved_paths, start_utc, end_utc,
+                    max_records=max_records, enabled=auto_expand_time_range,
+                    request_id=request_id, request_start=request_start,
+                )
+            finally:
+                # The helper owns and closes every parser spool, including its
+                # initial input and partially failed expansion attempts.
                 parse_result = None
-                try:
-                    parse_result = parse_event_files(
-                        saved_paths,
-                        range_decision.start_utc,
-                        range_decision.end_utc,
-                        max_records,
-                    )
-                    if parse_result.records or not parse_result.errors:
-                        analysis = analyze_events(
-                            parse_result,
-                            range_decision.start_utc,
-                            range_decision.end_utc,
-                        )
-                        adaptive_range_metadata["applied"] = True
-                    else:
-                        adaptive_range_metadata["expansion_error"] = (
-                            "확장 범위에서 분석 가능한 이벤트를 읽지 못해 최초 선택 범위 결과를 유지했습니다."
-                        )
-                        parse_result.close()
-                        parse_result = None
-                        analysis = initial_analysis
-                except Exception as exc:
-                    if parse_result is not None:
-                        parse_result.close()
-                        parse_result = None
-                    analysis = initial_analysis
-                    adaptive_range_metadata["expansion_error"] = (
-                        "확장 범위 재분석 중 오류가 발생해 최초 선택 범위 결과를 유지했습니다."
-                    )
-                    _stage_log(
-                        request_id,
-                        request_start,
-                        "adaptive_range_error",
-                        error_type=type(exc).__name__,
-                    )
-                if adaptive_range_metadata["applied"]:
-                    _stage_log(
-                        request_id,
-                        request_start,
-                        "adaptive_range",
-                        expanded=True,
-                        start=isoformat_utc(range_decision.start_utc),
-                        end=isoformat_utc(range_decision.end_utc),
-                        records_loaded=len(parse_result.records) if parse_result else 0,
-                    )
-            analysis["adaptive_time_range"] = adaptive_range_metadata
             scope = analysis.get("scope")
             if isinstance(scope, dict):
                 scope["requested_start_utc"] = isoformat_utc(start_utc)
                 scope["requested_end_utc"] = isoformat_utc(end_utc)
-            # The disk-backed network spool is no longer needed after the two
-            # analysis passes. Release its descriptor before LM inference or
-            # a slow response write, both of which may take several minutes.
-            if parse_result is not None:
-                parse_result.close()
-                parse_result = None
             checkpoint = _mark_stage(
                 request_id,
                 request_start,
@@ -786,6 +739,146 @@ class CATRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[CAT] {self.address_string()} - {format % args}")
+
+
+def _expand_analysis_context(
+    analysis: dict[str, Any],
+    parse_result: ParseResult,
+    saved_paths: list[Path],
+    start_utc: datetime | None,
+    end_utc: datetime | None,
+    *,
+    max_records: int,
+    enabled: bool,
+    request_id: str,
+    request_start: float,
+) -> dict[str, Any]:
+    """Investigate preceding evidence while preserving the selected incident.
+
+    This helper owns every parse result. Each parse retains the existing XML
+    deadline and resource caps; the wall-clock budget prevents another pass
+    from starting after it, rather than interrupting a running parser.
+    """
+    started_at = perf_counter()
+    current: ParseResult | None = parse_result
+    effective_start, effective_end = start_utc, end_utc
+    anchors = incident_focus_anchors(analysis)
+    metadata = AdaptiveRangeDecision(start_utc, end_utc).metadata(
+        enabled=enabled, requested_start_utc=start_utc,
+        requested_end_utc=end_utc, parse_result=parse_result,
+    )
+    metadata.update({
+        "applied": False, "rounds": [], "rounds_completed": 0,
+        "initial_parser": parse_result.to_dict(), "focus_anchors": anchors,
+        "stop_reason": "disabled" if not enabled else "no_supported_expansion",
+        "limit_reached": False,
+        "limits": {
+            "max_rounds": DEFAULT_AUTO_EXPAND_MAX_ROUNDS,
+            "max_lookback_seconds": DEFAULT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS,
+            "budget_seconds": DEFAULT_AUTO_EXPAND_BUDGET_SECONDS,
+            "budget_scope": "between_passes",
+            "per_parse_timeout_seconds": XML_PARSE_TIMEOUT_SECONDS,
+        },
+    })
+    previous_pass_seconds = 0.0
+    try:
+        for round_index in range(DEFAULT_AUTO_EXPAND_MAX_ROUNDS + 1):
+            if not enabled:
+                break
+            decision = recommend_expanded_range(
+                analysis, current, effective_start, effective_end, enabled=True,
+                round_index=round_index, requested_start_utc=start_utc,
+                max_lookback_seconds=DEFAULT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS,
+                allow_end_expansion=round_index == 0,
+            )
+            gaps = root_trace_gaps(analysis)
+            if not decision.expanded:
+                if gaps and effective_start is not None and current.events_before_range <= 0:
+                    metadata["stop_reason"] = "no_earlier_uploaded_logs"
+                elif (gaps and start_utc is not None and effective_start is not None
+                      and (start_utc - effective_start).total_seconds() >= DEFAULT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS):
+                    metadata["stop_reason"] = "max_lookback"
+                    metadata["limit_reached"] = True
+                else:
+                    metadata["stop_reason"] = "no_supported_expansion"
+                break
+            if round_index >= DEFAULT_AUTO_EXPAND_MAX_ROUNDS:
+                metadata.update(stop_reason="max_rounds", limit_reached=True)
+                break
+            elapsed = perf_counter() - started_at
+            if elapsed + previous_pass_seconds >= DEFAULT_AUTO_EXPAND_BUDGET_SECONDS:
+                metadata.update(stop_reason="time_budget", limit_reached=True)
+                break
+            round_info: dict[str, Any] = {
+                "round": round_index + 1, "applied": False,
+                "start_utc": isoformat_utc(decision.start_utc),
+                "end_utc": isoformat_utc(decision.end_utc),
+                "reasons": list(decision.reasons), "lookup_targets": gaps,
+            }
+            metadata["rounds"].append(round_info)
+            metadata["expanded"] = True
+            metadata["reasons"] = list(dict.fromkeys([
+                *metadata["reasons"], *decision.reasons,
+            ]))
+            current.close()
+            current = None
+            pass_started_at = perf_counter()
+            try:
+                current = parse_event_files(
+                    saved_paths, decision.start_utc, decision.end_utc, max_records,
+                )
+                round_info["parser"] = current.to_dict()
+                if not current.records and current.errors:
+                    raise ValueError("expanded parse contains no usable events")
+                candidate = analyze_events(
+                    current, decision.start_utc, decision.end_utc,
+                    **({"focus_anchors": anchors} if anchors else {}),
+                )
+                source = (candidate.get("intrusion_chain") or {}).get("source") or {}
+                if anchors and source.get("focus_unresolved"):
+                    metadata["stop_reason"] = "incident_focus_unavailable"
+                    metadata["expansion_error"] = "확장 범위에서 기존 침해 후보의 연결 증거가 보존되지 않아 마지막 성공한 분석 결과를 유지했습니다."
+                    round_info["error"] = metadata["expansion_error"]
+                    break
+                analysis = candidate
+                effective_start, effective_end = decision.start_utc, decision.end_utc
+                round_info["applied"] = True
+                metadata["applied"] = True
+                metadata["rounds_completed"] += 1
+                _stage_log(
+                    request_id, request_start, "adaptive_range",
+                    round=round_index + 1, expanded=True,
+                    start=isoformat_utc(effective_start), end=isoformat_utc(effective_end),
+                    records_loaded=len(current.records),
+                )
+                if current.errors or not current.network_scan_complete or current.network_spool_limit_reached:
+                    metadata.update(stop_reason="parser_or_retention_limit", limit_reached=True)
+                    break
+            except Exception as exc:
+                metadata["stop_reason"] = "expansion_error"
+                retained = "최초 선택 범위 결과" if not metadata["applied"] else "마지막 성공한 분석 결과"
+                metadata["expansion_error"] = f"확장 범위 재분석 중 오류가 발생해 {retained}를 유지했습니다."
+                round_info["error"] = metadata["expansion_error"]
+                _stage_log(request_id, request_start, "adaptive_range_error", error_type=type(exc).__name__)
+                break
+            finally:
+                previous_pass_seconds = perf_counter() - pass_started_at
+                round_info["elapsed_seconds"] = round(previous_pass_seconds, 3)
+    finally:
+        if current is not None:
+            current.close()
+    metadata["effective_start_utc"] = isoformat_utc(effective_start)
+    metadata["effective_end_utc"] = isoformat_utc(effective_end)
+    metadata["elapsed_seconds"] = round(perf_counter() - started_at, 3)
+    metadata["missing_evidence"] = root_trace_gaps(analysis)
+    metadata["additional_logs_required"] = bool(metadata["missing_evidence"])
+    metadata["coverage_note"] = (
+        "이전 시점 추가 분석은 업로드된 로그 안에서만 수행됩니다. 남은 부모·파일 생성자 증거는 더 이른 Sysmon 1/11, Security 4688 로그 등으로 확인해야 합니다."
+        if metadata["additional_logs_required"] else
+        "업로드된 로그의 실제 프로세스·파일 생성 근거와 선택 범위 경계를 기준으로 추가 분석 여부를 결정했습니다."
+    )
+    analysis["adaptive_time_range"] = metadata
+    return analysis
 
 
 class CATHTTPServer(ThreadingHTTPServer):

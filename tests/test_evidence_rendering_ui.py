@@ -87,6 +87,58 @@ process.stdout.write(String(vm.runInContext(args.expression, sandbox)));
         self.assertIn("로컬 근거 보완 2개", html)
         self.assertNotIn("미복구", html)
 
+    def test_origin_review_logs_precede_steps_and_preserve_original_evidence(self) -> None:
+        data = {
+            "origin_process": {"process": "source.exe"},
+            "related_events": [{
+                "time": "2026-09-10T00:00:00Z", "event_id": 1, "record_id": 42,
+                "host": "PC01", "provider": "Microsoft-Windows-Sysmon", "channel": "Sysmon/Operational",
+                "source_file": "case.evtx", "source_ref": "case.evtx#42",
+                "review_reason": "통신 프로세스를 처음 생성한 부모 확인",
+                "relationship_basis": "동일 ParentProcessGuid", "review_priority": 1,
+                "fields": {"Image": "C:\\Temp\\source.exe", "CommandLine": '<script>alert("x")</script>\narg'},
+                "text_truncated_fields": ["CommandLine"],
+            }],
+            "related_event_scope": {"truncated": True, "omitted_event_count": 2},
+            "steps": [{"order": 1, "process": "child.exe", "phase": "통신"}],
+        }
+        html = self.render("renderIntrusionChain(input)", data)
+        self.assertLess(html.index("분석관 우선 검토 로그"), html.index("연결된 후속 행위"))
+        self.assertIn("case.evtx#42", html)
+        self.assertIn("통신 프로세스를 처음 생성한 부모 확인", html)
+        self.assertIn("동일 ParentProcessGuid", html)
+        self.assertIn("Sysmon/Operational", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertIn("원문 필드 일부 생략", html)
+        self.assertIn("관련 로그 2건이 생략", html)
+
+    def test_summary_prioritizes_source_process_before_time_range_statistics(self) -> None:
+        html = self.render("renderSummaryContents(input)", {
+            "summary": {}, "scope": {"start_utc": "2026-09-10T00:00:00Z"},
+            "intrusion_chain": {"origin_process": {"process": "source.exe"}, "related_events": [{"event_id": 1}]},
+        })
+        self.assertIn("침해 시발점 프로세스 · 최우선 조사 대상", html)
+        self.assertLess(html.index("source.exe"), html.index("분석 범위"))
+        self.assertIn("우선 검토 로그", html)
+
+    def test_adaptive_range_displays_completed_passes_and_unresolved_coverage(self) -> None:
+        html = self.render("renderAdaptiveTimeRange(input)", {
+            "enabled": True, "applied": True, "rounds_completed": 2, "stop_reason": "no_earlier_uploaded_logs",
+            "requested_start_utc": "2026-09-10T10:00:00Z", "effective_start_utc": "2026-09-10T08:00:00Z",
+            "missing_evidence": [{"reason": "상위 생성자 미확인"}], "coverage_note": "더 이른 Sysmon 1/11 수집 필요",
+            "rounds": [{"round": 1, "applied": True, "start_utc": "2026-09-10T09:00:00Z",
+                        "reasons": ["부모 실행 확인 <img src=x>"]}],
+        })
+        self.assertIn("2회", html)
+        self.assertNotIn("2건회", html)
+        self.assertIn("업로드한 로그에 더 이른 기록이 없음", html)
+        self.assertIn("더 이른 Sysmon 1/11 수집 필요", html)
+        self.assertIn("추가 분석 구간 확인", html)
+        self.assertIn("2026-09-10T09:00:00Z", html)
+        self.assertIn("&lt;img src=x&gt;", html)
+        self.assertNotIn("<img", html)
+
 
 if __name__ == "__main__":
     unittest.main()

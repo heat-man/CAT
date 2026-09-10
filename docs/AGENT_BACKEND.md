@@ -6,9 +6,15 @@ CAT 0.2.0의 기본 보고서 에이전트는 LM Studio 0.4.8 이상에서 제�
 
 - `lmstudio`: 기본값. 구조화된 CAT 분석 JSON을 Qwen에 전달해 한국어 조사 보고서를 만듭니다.
 - `rule`: 네트워크 호출 없이 CAT 규칙 엔진만으로 결정적 Markdown 보고서를 만듭니다.
-- `codex_dev`: 소스 개발 검증 전용이며 운영 릴리스와 UI에서 기본 비활성화됩니다.
+- `codex_dev`: 소스 개발 검증 전용이며 운영 릴리스에서 기본 비활성화됩니다.
+
+웹에는 backend·LM URL·모델 선택 입력이 없습니다. 분석 요청에서 `agent_backend`, `use_llm`, `lm_url`, `lm_model`을 생략하여 서버의 `CAT_AGENT_BACKEND`, `LM_STUDIO_URL`, `LM_STUDIO_MODEL`을 사용하고, 과거 브라우저에 저장된 LM 설정은 무시합니다. 관리자가 환경 변수를 변경한 뒤 CAT를 재시작하면 새 웹 분석에 적용됩니다. 기존 `/api/analyze`의 명시적 backend·모델·endpoint 필드와 보안 검증은 유지됩니다.
 
 HTTP 연결 실패나 빈 응답처럼 사용할 모델 결과가 없으면 분석 결과는 버리지 않고 규칙 기반 보고서로 fallback합니다. 기본 자유 형식 모드에서는 JSON Schema를 요청하지 않으며 JSON, Markdown, 일반 텍스트 content를 모두 보고서로 사용할 수 있습니다.
+
+보고서의 우선 목표는 최초 비정상 행위·통신을 유발한 프로세스를 식별하고 그 상위 실행 주체·파일 생성 경위를 확인하는 것입니다. LM 입력은 원인·부모·생성자·연관 로그를 먼저 선별하며, 시간순 나열은 인과관계를 확인하는 보조 근거입니다. 원인 요약과 로컬 연관 로그는 LM의 strict 검증 여부와 관계없이 최종 Markdown에 포함됩니다. `intrusion_chain.related_events`와 `related_event_scope`에서 원본 참조·검토 이유·보관 한계를 확인합니다.
+
+선행 근거가 부족하면 업로드된 파일 안에서 시간 범위를 반복 확장합니다. 웹은 체크박스 없이 항상 `auto_expand_time_range=true`를 요청합니다. 기존 API에서 이 필드를 생략하면 `CAT_AUTO_EXPAND_TIME_RANGE`(기본 `true`)를 따르고, 명시적인 `false` 요청도 계속 지원합니다. 환경 변수만 `false`로 바꿔도 웹의 명시적인 활성화 요청에는 영향을 주지 않습니다. 기본 `CAT_AUTO_EXPAND_MAX_ROUNDS=4`, `CAT_AUTO_EXPAND_MAX_LOOKBACK_SECONDS=86400`, `CAT_AUTO_EXPAND_BUDGET_SECONDS=600`입니다. 기본 1시간 창을 회차마다 두 배로 늘리고, 원래 사건의 호스트·GUID·원본 참조로 조사 대상을 유지합니다. 예산은 회차 사이에 검사하며 각 파싱의 기존 timeout은 유지됩니다. `analysis.adaptive_time_range`에 회차·유효 범위·중단 이유·남은 수집 대상을 기록합니다.
 
 ## 기본 endpoint
 
@@ -24,12 +30,14 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 
 `LM_STUDIO_URL`은 `http` 또는 `https`, 유효한 host/port, query와 fragment가 없는 URL이어야 합니다. base URL, `/v1`, 완전한 `/v1/chat/completions` 형식을 받을 수 있으며 CAT가 endpoint를 정규화합니다. 잘못된 값은 서버 시작 시 실패합니다.
 
-`CAT_ALLOW_CUSTOM_LM_URL=true`가 기본이므로 브라우저에서 endpoint를 바꿀 수 있고 마지막 URL과 모델 ID를 해당 브라우저에 저장합니다. 고정 endpoint만 허용하려면 `false`로 설정합니다. 서버에 설정한 `LM_STUDIO_URL`과 포트 1234의 loopback 주소는 기본 허용합니다. 다른 private IP나 내부 hostname은 `CAT_LM_ALLOWED_ORIGINS=http://192.168.100.20:1234,https://lm.internal:5678`처럼 scheme·host·port가 모두 일치하는 origin 허용 목록에 넣어야 합니다. 호스트와 포트를 분리하지 않으므로 허용하지 않은 조합이 새로 생기지 않습니다. 임의 endpoint는 CAT 서버가 접근 가능한 주소에 POST를 보내므로 외부 노출 시에도 방화벽·인증을 적용해야 합니다. `LM_STUDIO_API_KEY`/`CAT_LM_API_KEY`는 기본 `LM_STUDIO_URL`에만 전달됩니다. 신뢰한 추가 endpoint에 키가 필요하면 `CAT_LM_API_KEY_ALLOWED_ENDPOINTS`에 정규화 가능한 전체 URL을 정확히 지정합니다.
+웹은 서버의 고정 endpoint를 사용합니다. `CAT_ALLOW_CUSTOM_LM_URL=true`는 기존 API의 `lm_url`을 통한 endpoint 변경을 허용하는 기본값이며 웹에 입력란을 표시하는 설정이 아닙니다. API에서도 고정 endpoint만 허용하려면 `false`로 설정합니다. 서버에 설정한 `LM_STUDIO_URL`과 포트 1234의 loopback 주소는 기본 허용합니다. 다른 private IP나 내부 hostname은 `CAT_LM_ALLOWED_ORIGINS=http://192.168.100.20:1234,https://lm.internal:5678`처럼 scheme·host·port가 모두 일치하는 origin 허용 목록에 넣어야 합니다. origin에는 `/v1`이나 `/v1/chat/completions` 같은 path를 넣지 않습니다. 호스트와 포트를 분리하지 않으므로 허용하지 않은 조합이 새로 생기지 않습니다. 임의 endpoint는 CAT 서버가 접근 가능한 주소에 POST를 보내므로 외부 노출 시에도 방화벽·인증을 적용해야 합니다. `LM_STUDIO_API_KEY`/`CAT_LM_API_KEY`는 기본 `LM_STUDIO_URL`에만 전달됩니다. 신뢰한 추가 endpoint에 키가 필요하면 `CAT_LM_API_KEY_ALLOWED_ENDPOINTS`에 정규화 가능한 전체 URL을 정확히 지정합니다.
 
 ## Qwen3.6-35B-A3B 기본 파라미터
 
 | 환경 변수 | 기본값 | 설명 |
 |---|---:|---|
+| `CAT_AGENT_BACKEND` | `lmstudio` | 웹 분석에 적용할 서버 기본 backend |
+| `LM_STUDIO_URL` | `http://192.168.100.1:1234/v1/chat/completions` | 웹 분석에 적용할 주 endpoint |
 | `LM_STUDIO_MODEL` | `qwen/qwen3.6-35b-a3b` | `/v1/models`의 정확한 ID로 재설정 |
 | `LM_STUDIO_API_KEY` | 없음 | 선택적 Bearer token |
 | `CAT_LM_API_KEY` | 없음 | API key 별칭; `LM_STUDIO_API_KEY`가 우선 |
@@ -50,7 +58,7 @@ $env:LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 | `CAT_LM_MAX_SCENARIO_CANDIDATES` | `50` | LLM 입력 시나리오 후보 수, 1~500 |
 | `CAT_LM_MAX_TIMELINE_EVENTS` | `200` | LLM 입력 timeline 수, 1~5000 |
 | `CAT_LM_USE_PROXY` | `false` | 환경/Windows 시스템 프록시 사용 여부 |
-| `CAT_ALLOW_CUSTOM_LM_URL` | `true` | UI 임의 endpoint 허용 여부 |
+| `CAT_ALLOW_CUSTOM_LM_URL` | `true` | API의 `lm_url` 변경 허용 여부; 웹은 서버 endpoint 사용 |
 | `CAT_LM_ALLOWED_ORIGINS` | 빈값 | 쉼표로 구분한 추가 endpoint origin(`scheme://host:port`) 허용 목록 |
 | `CAT_LM_API_KEY_ALLOWED_ENDPOINTS` | 빈값 | 설정 API key를 전달할 신뢰 endpoint 전체 URL 목록 |
 | `CAT_LM_STRICT_VALIDATION` | `false` | `false`: 자유 형식 응답, `true`: JSON Schema/required section 강제 검증 |
@@ -429,7 +437,7 @@ LM timeout은 기본 900초이고 환경변수로 최대 7200초까지 조정할
 ## 독립망 보안 기본값
 
 - `CAT_LM_USE_PROXY=false`: 시스템/환경 프록시 우회
-- `CAT_ALLOW_CUSTOM_LM_URL=true`: 브라우저에서 endpoint 변경 허용; 고정 운용은 `false`로 잠금
+- `CAT_ALLOW_CUSTOM_LM_URL=true`: API의 `lm_url` 변경 허용; API까지 고정 운용하려면 `false`로 잠금. 웹은 항상 서버 endpoint 사용
 - `CAT_LM_ALLOWED_ORIGINS`: 신뢰한 LM Studio의 scheme·host·port 조합만 정확히 지정해 임의 내부 목적지 요청 제한
 - `CAT_LM_API_KEY_ALLOWED_ENDPOINTS`: 기본 endpoint 외 Bearer token을 받을 주소를 전체 endpoint 단위로 제한
 - HTTP redirect 거부: 고정 endpoint 우회와 Bearer token 전달 차단
@@ -445,4 +453,4 @@ $env:CAT_AGENT_BACKEND = "rule"
 
 ## Codex 개발 검증
 
-Codex 경로는 인터넷 허용 개발 환경에서만 사용합니다. 운영 ZIP은 Codex 실행 및 프롬프트 export 스크립트를 포함하지 않습니다. 소스 저장소에서 명시적으로 `CAT_ENABLE_CODEX_DEV=true`를 설정한 경우에만 UI와 서버가 backend를 허용합니다.
+Codex 경로는 인터넷 허용 개발 환경에서만 사용합니다. 운영 ZIP은 Codex 실행 및 프롬프트 export 스크립트를 포함하지 않습니다. 소스 저장소에서 명시적으로 `CAT_ENABLE_CODEX_DEV=true`를 설정한 경우에만 서버가 backend를 허용합니다. 웹에 개발 backend 선택 UI는 없으며, 승인된 개발 환경의 서버 설정 또는 기존 API 필드로 지정합니다.

@@ -77,7 +77,7 @@ class PdfExportUiTests(unittest.TestCase):
         self.assertIn("CAT 요약 내용", app)
         self.assertIn("침해행위 및 탐지 결과", app)
         self.assertIn("function renderIntrusionChain(chain)", app)
-        self.assertIn("최초 침해 프로세스와 후속 흐름", app)
+        self.assertIn("침해 시발점 프로세스 추적", app)
         self.assertIn("renderIntrusionChain(safeAnalysis.intrusion_chain)", app)
         self.assertIn("증거 및 분석 한계", app)
         self.assertIn("renderSummaryContents(safeAnalysis, false)", app)

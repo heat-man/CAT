@@ -64,6 +64,8 @@ class ReleasePackageTests(unittest.TestCase):
                 f"{package_root}/images/{name}"
                 for name in (
                     "cat.jpg",
+                    "cat_staring.jpg",
+                    "cat_cursor.png",
                     "cat_down.jpg",
                     "cat_dress.jpg",
                     "cat_sleep.jpg",
@@ -123,6 +125,13 @@ class ReleasePackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="cat-release-test-") as temp_dir:
             archive = Path(temp_dir) / "missing-runtime.zip"
             _write_valid_zip(archive, omit={"scripts/run.ps1"})
+            with self.assertRaisesRegex(ValueError, "required runtime files missing"):
+                VERIFIER.validate_archive(archive)
+
+    def test_rejects_missing_cursor_sprite(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cat-release-test-") as temp_dir:
+            archive = Path(temp_dir) / "missing-cursor.zip"
+            _write_valid_zip(archive, omit={"images/cat_cursor.png"})
             with self.assertRaisesRegex(ValueError, "required runtime files missing"):
                 VERIFIER.validate_archive(archive)
 

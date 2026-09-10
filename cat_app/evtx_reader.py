@@ -683,7 +683,7 @@ def _is_endpoint_network_analysis_event(record: EventRecord) -> bool:
         provider == "microsoft-windows-sysmon"
         and channel == "microsoft-windows-sysmon/operational"
     ):
-        return event_id in {"1", "3", "5", "11", "22"}
+        return event_id in {"1", "3", "5", "7", "8", "10", "11", "22"}
     if (
         provider == "microsoft-windows-security-auditing"
         and channel == "security"

@@ -91,6 +91,41 @@ class LMRuntimeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.strict_validation.stop()
 
+    def test_origin_review_and_raw_related_logs_follow_validation_in_both_modes(self) -> None:
+        analysis = _analysis()
+        origin = {"process": "invoice.exe", "process_guid": "{origin}", "host": "PC01",
+                  "source_ref": "case.evtx#1", "start_time": "2026-09-01T00:00:00Z"}
+        analysis["intrusion_chain"] = {
+            "origin_process": origin, "observed_trigger_process": origin,
+            "origin_assessment": {"status": "initial_source_unresolved", "malware_confirmed": False},
+            "related_events": [{"event_id": "8", "provider": "Microsoft-Windows-Sysmon",
+                "channel": "Microsoft-Windows-Sysmon/Operational", "host": "PC01",
+                "source_file": "case.evtx", "record_id": "2", "source_ref": "case.evtx#2",
+                "time": "2026-09-01T00:00:01Z", "review_priority": 2,
+                "review_reason": "원인 후보의 원격 스레드 생성 검토",
+                "fields": {"SourceProcessGUID": "{origin}", "TargetProcessGUID": "{target}"}}],
+        }
+        for strict in (True, False):
+            completion = (_structured_completion([]) if strict else
+                          _completion_with_content("# 자유 보고서\n\nLM이 작성한 분석 본문"))
+            with self.subTest(strict=strict), mock.patch.object(
+                reporting, "open_lm_request", return_value=_FakeResponse(completion),
+            ) as request_mock:
+                report, status = reporting.generate_report(
+                    analysis, use_llm=True, lm_url=self.base_url, model=self.model_id,
+                    strict_validation=strict,
+                )
+            self.assertTrue(status["used"], status["error"])
+            self.assertEqual(status["structured_report_validated"], strict)
+            self.assertEqual(status["report_evidence_count"], 2)
+            self.assertLess(report.index("## 최초 비정상"), report.index("## CAT 시간순 증거 부록"))
+            self.assertIn("invoice.exe", report.split("## CAT 시간순 증거 부록")[0])
+            self.assertIn("SourceProcessGUID", report)
+            self.assertIn("{target}", report)
+            self.assertEqual(report.count("file=case.evtx / record=2"), 1)
+            payload = json.loads(request_mock.call_args.args[0].data)
+            self.assertEqual("response_format" in payload, strict)
+
     def test_qwen_payload_auth_and_response_metadata(self) -> None:
         completion = _structured_completion([])
         with (
@@ -1159,22 +1194,22 @@ class LMRuntimeTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(server_errors, [])
 
-    def test_ui_uses_health_defaults_without_exposing_codex_by_default(self) -> None:
+    def test_ui_uses_fixed_server_configuration_without_lm_controls(self) -> None:
         index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn('value="http://172.16.100.51:1234"', index)
-        self.assertIn('placeholder="http://192.168.100.1:1234"', index)
+        for name in ("agent_backend", "lm_url", "lm_model", "use_llm"):
+            self.assertNotIn(f'name="{name}"', index)
         self.assertNotIn("lmUrlHelp", index)
         self.assertNotIn("기본 호스트 주소이며", index)
         self.assertNotIn('value="qwen"', index)
         self.assertNotIn('<option value="codex_dev"', index)
-        self.assertIn("data.lm_studio_url", app)
-        self.assertIn("data.allow_custom_lm_url === true", app)
-        self.assertIn("preferredLmUrl(data.lm_studio_url)", app)
-        self.assertIn("LEGACY_LM_STUDIO_DEFAULTS", app)
-        self.assertIn("LM_URL_DEFAULT_MIGRATION_KEY", app)
-        self.assertIn('=== "done"', app)
-        self.assertIn("data.default_model", app)
+        self.assertNotIn("preferredLmUrl", app)
+        self.assertNotIn("LEGACY_LM_STUDIO_DEFAULTS", app)
+        self.assertNotIn("LM_URL_DEFAULT_MIGRATION_KEY", app)
+        self.assertNotIn('readPreference("cat.lm_model")', app)
+        self.assertIn('fetch("/api/health")', app)
+        self.assertIn("data.max_upload_bytes", app)
         self.assertIn("renderParserWarning", app)
         self.assertIn("입력 파싱 경고", app)
 

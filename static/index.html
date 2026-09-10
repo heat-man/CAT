@@ -8,12 +8,20 @@
   </head>
   <body>
     <header class="app-header">
-      <div>
-        <h1>CAT</h1>
-        <p>Cyber Activity Tracker</p>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none"><path d="M7 13V6l7 4h4l7-4v7c2 2 3 4 3 7 0 6-5 9-12 9S4 26 4 20c0-3 1-5 3-7Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M11 18h.01M21 18h.01" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><path d="m14 22 2 2 2-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <div class="brand-copy">
+          <h1>CAT</h1>
+          <p>Cyber Activity Tracker</p>
+        </div>
+        <span class="header-divider" aria-hidden="true"></span>
+        <span class="header-context">Windows 침해 분석 워크스페이스</span>
       </div>
       <div class="status-strip">
-        <span id="healthStatus">대기</span>
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="healthStatus" role="status">연결 확인 중</span>
       </div>
     </header>
 
@@ -21,25 +29,37 @@
       <section class="input-panel" aria-label="분석 입력">
         <form id="analysisForm">
           <div class="panel-title">
-            <h2>분석 요청</h2>
-            <button type="submit" id="analyzeButton">분석 실행</button>
+            <p class="eyebrow">NEW INVESTIGATION</p>
+            <h2>로그 분석</h2>
+            <p class="panel-description">단말의 로그에서 침해의 시작과<br />원인 프로세스를 추적합니다.</p>
           </div>
 
           <label class="file-drop" id="fileDrop">
-            <input id="evtxFiles" name="files" type="file" multiple accept=".evtx,.xml" />
-            <span>EVTX/XML 파일 선택</span>
-            <strong id="fileSummary">선택된 파일 없음</strong>
+            <input id="evtxFiles" name="files" type="file" multiple accept=".evtx,.xml" aria-label="분석할 EVTX 또는 XML 파일 선택" aria-describedby="fileSummary" />
+            <span class="upload-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <span class="file-drop-title">로그 파일을 추가하세요</span>
+            <span class="file-drop-hint">여기로 드래그하거나 클릭하여 선택</span>
+            <strong id="fileSummary" aria-live="polite">EVTX · XML · 여러 파일 선택 가능</strong>
           </label>
 
-          <div class="form-grid">
-            <label>
-              <span>시작 시간</span>
-              <input name="start_time" type="datetime-local" />
-            </label>
-            <label>
-              <span>종료 시간</span>
-              <input name="end_time" type="datetime-local" />
-            </label>
+          <fieldset class="time-range-fields">
+            <legend>분석 시간 범위 <span>필수</span></legend>
+            <div class="form-grid time-range-grid">
+              <label>
+                <span>시작 시간</span>
+                <input name="start_time" type="datetime-local" required />
+              </label>
+              <label>
+                <span>종료 시간</span>
+                <input name="end_time" type="datetime-local" required />
+              </label>
+            </div>
+            <p class="field-note">조사할 시작 시간과 종료 시간을 지정하세요.</p>
+          </fieldset>
+
+          <div class="form-grid compact-fields">
             <label>
               <span>시간대</span>
               <input name="timezone" type="text" value="Asia/Seoul" />
@@ -50,28 +70,11 @@
             </label>
           </div>
 
-          <label class="toggle analysis-option">
-            <input id="autoExpandTimeRange" name="auto_expand_time_range" type="checkbox" value="true" aria-describedby="autoExpandTimeRangeHelp" checked />
-            <span>경계 증거가 있으면 업로드한 파일 안에서 분석 시간대를 자동 확장</span>
-          </label>
-          <p id="autoExpandTimeRangeHelp" class="field-note">선택한 시간 범위의 앞뒤에서 침해 흐름을 잇는 증거가 발견되면 CAT가 필요한 구간만 추가 분석합니다.</p>
-
-          <div class="lm-row">
-            <label>
-              <span>에이전트</span>
-              <select name="agent_backend" id="agentBackend">
-                <option value="lmstudio" selected>LM Studio Qwen</option>
-                <option value="rule">규칙 기반 보고서</option>
-              </select>
-            </label>
-            <label>
-              <span>LM Studio URL</span>
-              <input name="lm_url" id="lmUrl" type="url" autocomplete="off" placeholder="http://192.168.100.1:1234" />
-            </label>
-            <label>
-              <span>모델</span>
-              <input name="lm_model" id="lmModel" type="text" autocomplete="off" />
-            </label>
+          <div class="form-footer">
+            <button type="submit" id="analyzeButton">
+              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m7 4 6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              분석 시작
+            </button>
           </div>
         </form>
       </section>
@@ -96,18 +99,18 @@
               type="button"
               aria-haspopup="dialog"
               aria-controls="historyDialog"
-            >분석 이력</button>
+            ><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M3 9a7 7 0 1 1 2 6M3 9V4m0 5h5m2-3v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>분석 이력</button>
             <button
               id="savePdfButton"
               class="secondary"
               type="button"
               title="보고서·요약·침해행위·증거 한계를 함께 PDF로 저장합니다."
               disabled
-            >PDF로 저장</button>
+            ><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 3v9m0 0 3-3m-3 3L7 9M4 13v3a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>PDF 저장</button>
           </div>
         </div>
 
-        <div id="loading" class="loading hidden">
+        <div id="loading" class="loading hidden" role="status" aria-live="polite">
           <div class="progress-track">
             <div id="progressFill" class="progress-fill"></div>
             <img id="progressCat" class="progress-cat" src="/asset/nyan_cat.gif" alt="" />
@@ -115,7 +118,7 @@
           <span id="loadingText">분석 준비 중</span>
         </div>
 
-        <div id="errorBox" class="error-box hidden"></div>
+        <div id="errorBox" class="error-box hidden" role="alert"></div>
 
         <article
           id="reportView"
@@ -134,8 +137,8 @@
             >
               <img
                 id="mainCatImage"
-                src="/asset/cat.jpg"
-                alt="선글라스를 쓴 회색 고양이"
+                src="/asset/cat_staring.jpg"
+                alt="이불 속에서 카메라를 바라보는 회색 고양이"
                 draggable="false"
               />
               <button
@@ -156,6 +159,11 @@
               >
                 <span aria-hidden="true">&#10095;</span>
               </button>
+            </div>
+            <div class="empty-state-copy">
+              <span class="welcome-label">FROM EVIDENCE TO ORIGIN</span>
+              <h2>침해의 시작을 찾아보세요</h2>
+              <p>Windows 이벤트 로그를 업로드하면<br />원인 프로세스와 연관 증거를 함께 분석합니다.</p>
             </div>
           </div>
         </article>
@@ -179,6 +187,9 @@
       <div id="historyList" class="history-list" role="list"></div>
     </dialog>
 
+    <div id="catCursor" class="cat-cursor" aria-hidden="true" hidden>
+      <img id="catCursorImage" src="/asset/cat_cursor.png" alt="" draggable="false" />
+    </div>
     <script src="/static/app.js" type="module"></script>
   </body>
 </html>

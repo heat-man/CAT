@@ -47,25 +47,19 @@ class AnalysisHistoryUiTests(unittest.TestCase):
         self.assertIn("업로드한 원본 파일과 API 키는 저장하지 않습니다", source)
         self.assertTrue(all(count == 1 for count in parser.id_counts.values()))
 
-    def test_auto_time_expansion_is_checked_and_submitted_with_form(self) -> None:
+    def test_auto_time_expansion_is_always_submitted_without_a_control(self) -> None:
         source = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         parser = _HistoryUiParser()
         parser.feed(source)
 
-        self.assertIsNotNone(parser.auto_expand)
-        assert parser.auto_expand is not None
-        self.assertEqual(parser.auto_expand.get("type"), "checkbox")
-        self.assertEqual(parser.auto_expand.get("value"), "true")
-        self.assertEqual(parser.auto_expand.get("id"), "autoExpandTimeRange")
-        self.assertEqual(parser.auto_expand.get("aria-describedby"), "autoExpandTimeRangeHelp")
-        self.assertIn("autoExpandTimeRangeHelp", parser.elements)
-        self.assertIn("checked", parser.auto_expand)
-        self.assertIn("업로드한 파일 안에서 분석 시간대를 자동 확장", source)
+        self.assertIsNone(parser.auto_expand)
+        self.assertNotIn("autoExpandTimeRange", parser.elements)
+        self.assertNotIn("autoExpandTimeRangeHelp", parser.elements)
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn('formData.delete("auto_expand_time_range")', app)
-        self.assertIn('formData.set(\n    "auto_expand_time_range"', app)
-        self.assertIn('autoExpandTimeRange?.checked === true ? "true" : "false"', app)
-        self.assertIn("data.adaptive_time_range?.default_enabled", app)
+        self.assertRegex(app, r'formData\.set\(\s*"auto_expand_time_range",\s*"true"\s*,?\s*\)')
+        self.assertNotIn("autoExpandTimeRange?.checked", app)
+        self.assertNotIn("data.adaptive_time_range?.default_enabled", app)
         self.assertIn("function renderAdaptiveTimeRange(adaptiveRange)", app)
         self.assertIn("실제 적용 범위", app)
         self.assertIn("확장 근거", app)

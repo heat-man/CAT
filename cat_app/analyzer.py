@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import heapq
 import ipaddress
+import json
 import math
 from pathlib import PureWindowsPath
 import re
@@ -55,6 +57,8 @@ INTRUSION_ANCESTOR_DEPTH_LIMIT = 16
 INTRUSION_FILE_LINK_WINDOW_SECONDS = 24 * 60 * 60
 INTRUSION_FILE_MATCH_LIMIT = 50_000
 INTRUSION_FILE_MATCHES_PER_PATH_LIMIT = 32
+INTRUSION_RELATED_EVENT_LIMIT = 512
+INTRUSION_RELATED_CHAR_LIMIT = 2 * 1024 * 1024
 ENDPOINT_RULE_EXTRA_RECORD_LIMIT = 8192
 ENDPOINT_RULE_EXTRA_CHAR_LIMIT = 16 * 1024 * 1024
 EVIDENCE_TEXT_CHAR_LIMIT = 8192
@@ -190,7 +194,13 @@ POWERSHELL_KEYWORDS = [
 
 
 @capture_report_evidence
-def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_utc: datetime | None) -> dict[str, Any]:
+def analyze_events(
+    parse_result: ParseResult,
+    start_utc: datetime | None,
+    end_utc: datetime | None,
+    *,
+    focus_anchors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     records = sorted(
         parse_result.records,
         key=lambda event: _event_time_sort_key(event.time_created),
@@ -242,6 +252,7 @@ def analyze_events(parse_result: ParseResult, start_utc: datetime | None, end_ut
         network_scan_complete=parse_result.network_scan_complete,
         network_spool_limit_reached=parse_result.network_spool_limit_reached,
         spool_scan_used=parse_result.has_network_record_spool,
+        focus_anchors=focus_anchors,
     )
 
     return {
@@ -2865,6 +2876,40 @@ def _intrusion_select_suspicious_events(
     return [suspicious_events[index] for index in sorted(selected)[:limit]]
 
 
+def _intrusion_matches_anchor(node: _IntrusionProcessNode, anchor: dict[str, Any]) -> bool:
+    if not isinstance(anchor, dict) or not anchor.get("host"):
+        return False
+    if _normalized_host(node.host) != _normalized_host(anchor.get("host")):
+        return False
+    guid = _normalized_process_guid(anchor.get("process_guid"))
+    if guid:
+        return node.process_guid == guid
+    if anchor.get("source_ref") and node.source_ref == anchor["source_ref"]:
+        return True
+    return bool(
+        node.process_id and node.start_time and anchor.get("start_time")
+        and node.process_id == _normalized_process_id(anchor.get("process_id"))
+        and isoformat_utc(node.start_time) == anchor["start_time"]
+        and _intrusion_normalized_file_path(node.process)
+        == _intrusion_normalized_file_path(anchor.get("process"))
+    )
+
+
+def _intrusion_path_reaches_focus(
+    key: tuple[str, ...], nodes: dict[tuple[str, ...], _IntrusionProcessNode],
+    focus_keys: set[tuple[str, ...]],
+) -> bool:
+    visited: set[tuple[str, ...]] = set()
+    for _ in range(INTRUSION_ANCESTOR_DEPTH_LIMIT + 1):
+        if key in focus_keys:
+            return True
+        if key not in nodes or key in visited:
+            break
+        visited.add(key)
+        key = nodes[key].parent_key
+    return False
+
+
 def _intrusion_chain(
     record_source: Callable[[], Iterator[EventRecord]],
     suspicious_events: list[dict[str, Any]],
@@ -2873,6 +2918,7 @@ def _intrusion_chain(
     network_scan_complete: bool,
     network_spool_limit_reached: bool,
     spool_scan_used: bool,
+    focus_anchors: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded, evidence-linked process-centric intrusion hypothesis.
 
@@ -3017,7 +3063,11 @@ def _intrusion_chain(
         guid_index,
         pid_index,
     )
-    signal_keys = {
+    focus_keys = {
+        key for key, node in nodes.items()
+        if any(_intrusion_matches_anchor(node, anchor) for anchor in focus_anchors or [])
+    }
+    signal_keys = focus_keys | {
         key for key, node in nodes.items() if node.event_refs or node.local_signals
     }
     candidate_groups: dict[tuple[str, ...], list[tuple[str, ...]]] = defaultdict(list)
@@ -3025,16 +3075,30 @@ def _intrusion_chain(
         root_key = _intrusion_suspicious_root(node_key, nodes, signal_keys)
         candidate_groups[root_key].append(node_key)
 
+    event_times = {
+        str(event.get("event_ref")): str(event.get("time") or "9999")
+        for event in selected_suspicious
+    }
     ranked_candidates = sorted(
         (
             (_intrusion_candidate_score(nodes[root], members, nodes), root, members)
             for root, members in candidate_groups.items()
         ),
         key=lambda item: (
+            not any(nodes[key].event_refs for key in item[2]),
+            min((event_times.get(ref, "9999") for key in item[2]
+                 for ref in nodes[key].event_refs), default="9999"),
             -item[0],
             _intrusion_node_sort_key(nodes[item[1]]),
         ),
     )
+    if focus_anchors:
+        # EVT labels change after re-analysis. Follow the original physical
+        # process identity and its ancestors, never an unrelated older group.
+        ranked_candidates = [
+            item for item in ranked_candidates
+            if any(_intrusion_path_reaches_focus(key, nodes, focus_keys) for key in item[2])
+        ]
 
     base_limitations = [
         "이 결과는 EVTX에 기록된 프로세스·DNS·통신의 시간 및 식별자 상관관계에 기반한 후보이며 침해를 확정하지 않습니다.",
@@ -3070,6 +3134,10 @@ def _intrusion_chain(
         "suspicious_event_count": len(suspicious_events),
         "suspicious_events_used": len(selected_suspicious),
         "pid_evidence_link_count": pid_evidence_link_count,
+        "focus_anchor_count": len(focus_anchors or []),
+        "focus_matched_process_count": len(focus_keys),
+        "focus_preserved": bool(focus_anchors and ranked_candidates),
+        "focus_unresolved": bool(focus_anchors and not ranked_candidates),
     }
     if not ranked_candidates:
         limitations = [
@@ -3102,6 +3170,8 @@ def _intrusion_chain(
             "steps": [],
             "evidence_refs": [],
             "source_refs": [],
+            "related_events": [],
+            "related_event_scope": _intrusion_related_scope(0, 0, 0, not network_scan_complete),
             "source": source_metadata,
             "truncated": bool(
                 process_node_limit_reached
@@ -3161,6 +3231,11 @@ def _intrusion_chain(
     relevant_set = set(relevant_keys)
     relevant_guid_index, relevant_pid_index, _ = _intrusion_process_indexes(
         {key: nodes[key] for key in relevant_keys}
+    )
+    related_events, related_scope = _intrusion_related_events(
+        record_source, nodes, relevant_keys, origin_key, set(upstream_keys),
+        relevant_guid_index, relevant_pid_index, raw_event_refs, file_provenance,
+        input_scan_limited=not network_scan_complete or network_spool_limit_reached,
     )
     followon_groups: dict[tuple[str, ...], dict[str, Any]] = {}
     followon_record_count = 0
@@ -3344,6 +3419,7 @@ def _intrusion_chain(
         or network_spool_limit_reached
         or file_link_limit_reached
         or upstream_limit_reached
+        or related_scope["truncated"]
     )
     evidence_refs = sorted(
         {
@@ -3366,8 +3442,8 @@ def _intrusion_chain(
         "status": "origin_process_candidate_identified",
         "candidate_only": True,
         "selection_method": (
-            "ProcessGuid/부모 계보와 의심 규칙·로컬 명령 신호가 가장 강하게 연결된 "
-            "후보 묶음에서 부모 계보와 실행 파일 생성 경위를 역추적해 선행 실행 유발 주체를 우선 지정"
+            "원래 조사 대상과의 연결을 유지하며 직접 의심 근거가 가장 이른 프로세스 묶음에서 "
+            "부모 계보·파일 생성 경위를 역추적해 최초 비정상 행위 또는 통신 유발 주체를 우선 지정"
         ),
         "confidence": confidence,
         "confidence_scope": "프로세스 및 이벤트 연결 신뢰도이며 악성 여부 신뢰도가 아닙니다.",
@@ -3436,6 +3512,8 @@ def _intrusion_chain(
         "steps": steps,
         "evidence_refs": evidence_refs,
         "source_refs": source_refs,
+        "related_events": related_events,
+        "related_event_scope": related_scope,
         "source": source_metadata,
         "truncated": truncated,
         "chain_truncated": truncated,
@@ -4056,6 +4134,130 @@ def _intrusion_relevant_processes(
                 continue
             queue.append((child_key, depth + 1))
     return relevant, limit_reached
+
+
+def _intrusion_related_scope(
+    matched: int, included: int, chars: int, input_scan_limited: bool,
+) -> dict[str, Any]:
+    omitted = max(0, matched - included)
+    limitations = []
+    if omitted:
+        limitations.append(f"원인 추적 연관 로그 {omitted}건은 보관 상한으로 제외되었습니다. 원본 EVTX/XML을 확인하세요.")
+    if input_scan_limited:
+        limitations.append("입력 스캔 또는 endpoint 보관이 불완전하여 연관 로그가 누락될 수 있습니다.")
+    return {
+        "matched_event_count": matched, "included_event_count": included,
+        "omitted_event_count": omitted, "serialized_chars": chars,
+        "max_events": INTRUSION_RELATED_EVENT_LIMIT, "max_chars": INTRUSION_RELATED_CHAR_LIMIT,
+        "truncated": bool(omitted), "input_scan_limited": input_scan_limited,
+        "limitations": limitations,
+        "note": "선택된 프로세스 계보와 식별자로 연결된 조사 대상 로그입니다. 관련성은 악성 판정이 아닙니다.",
+    }
+
+
+def _intrusion_related_events(
+    record_source: Callable[[], Iterator[EventRecord]],
+    nodes: dict[tuple[str, ...], _IntrusionProcessNode],
+    relevant_keys: list[tuple[str, ...]],
+    origin_key: tuple[str, ...], upstream_keys: set[tuple[str, ...]],
+    guid_index: dict[tuple[str, str], tuple[str, ...]],
+    pid_index: dict[tuple[str, str], list[tuple[str, ...]]],
+    raw_event_refs: dict[tuple[str, ...], str],
+    file_provenance: list[dict[str, Any]], *, input_scan_limited: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep bounded raw observations, including module loads and both injection participants."""
+    relevant = set(relevant_keys)
+    file_identities = {
+        _intrusion_raw_dict_identity(link["sample_evidence"])
+        for link in file_provenance if isinstance(link.get("sample_evidence"), dict)
+    }
+    reasons = {
+        "1": "원인 프로세스 또는 연결된 부모·자식의 생성 근거",
+        "4688": "원인 프로세스 또는 연결된 부모·자식의 생성 근거",
+        "3": "해당 프로세스의 실제 통신 대상 확인", "5156": "해당 프로세스의 허용 연결 확인",
+        "22": "통신 대상과 연관된 DNS 질의 확인",
+        "7": "실행 파일이 로드한 DLL·모듈과 서명·해시 확인",
+        "8": "원격 스레드 생성 주체와 대상 프로세스 확인",
+        "10": "프로세스 접근 주체·대상·접근 권한 확인",
+        "11": "실행 파일·연관 파일의 생성 주체 확인",
+        "5": "프로세스 종료 시각 및 생존 구간 확인", "4689": "프로세스 종료 확인",
+        "4103": "연결된 PowerShell 명령 내용 확인", "4104": "연결된 PowerShell 스크립트 내용 확인",
+    }
+    heap: list[tuple[Any, ...]] = []
+    matched = 0
+    chars = 2
+    for event in record_source():
+        if not (
+            (_provider(event) == "microsoft-windows-sysmon"
+             and _channel(event) == "microsoft-windows-sysmon/operational"
+             and event.event_id in {"1", "3", "5", "7", "8", "10", "11", "22"})
+            or _is_process_creation_event(event) or _is_process_termination_event(event)
+            or _is_network_connection_event(event)
+            or _is_powershell_event(event)
+        ):
+            continue
+        participants: list[tuple[tuple[str, ...], str, str]] = []
+        probes = [(event, "process")]
+        if event.event_id in {"8", "10"}:
+            probes = []
+            for prefix, role in (("Source", "source"), ("Target", "target")):
+                probes.append((replace(event, event_data={
+                    "ProcessGuid": _field(event, prefix + "ProcessGUID", prefix + "ProcessGuid") or "",
+                    "ProcessId": _field(event, prefix + "ProcessId", prefix + "ProcessID") or "",
+                    "Image": _field(event, prefix + "Image") or "",
+                }), role))
+        for probe, role in probes:
+            key = _intrusion_process_for_event(probe, nodes, guid_index, pid_index)
+            if key not in relevant:
+                continue
+            node = nodes[key]
+            if node.creation_observed and node.start_time and event.time_created and event.time_created < node.start_time:
+                continue
+            basis = "동일 호스트·ProcessGuid" if _field(probe, "ProcessGuid") else "동일 호스트·PID·이미지·시간창 (PID 재사용 확인 필요)"
+            participants.append((key, role, basis))
+        source_ref = _intrusion_source_ref(event.source_file, event.record_id, event.time_created)
+        if not participants and _intrusion_raw_event_identity(event) not in file_identities:
+            continue
+        matched += 1
+        priority = 3
+        if _is_process_creation_event(event):
+            priority = 0 if any(key == origin_key for key, _, _ in participants) else (
+                1 if any(key in upstream_keys for key, _, _ in participants) else 2
+            )
+        elif event.event_id in {"7", "8", "10"}:
+            priority = 2
+        elif event.event_id in {"5", "4689"}:
+            priority = 4
+        row = _evidence(event)
+        if event.event_id in {"8", "10"}:
+            # The record's actor remains the source, even if only its target
+            # belongs to the incident. Never relabel the target as the actor.
+            row.update(process=_field(event, "SourceImage"),
+                       process_id=_normalized_process_id(_field(event, "SourceProcessId", "SourceProcessID")),
+                       process_guid=_normalized_process_guid(_field(event, "SourceProcessGUID", "SourceProcessGuid")))
+        row.update(
+            source_ref=source_ref, review_priority=priority,
+            review_reason=reasons.get(str(event.event_id), "원인 프로세스와 연결된 행위의 실제 근거 확인"),
+            relationship_basis="; ".join(dict.fromkeys(basis for _, _, basis in participants))
+            or "동일 호스트·경로의 선행 파일 생성 (실행 바이너리 동일성 미확정)",
+            related_process_instance_ids=[nodes[key].process_instance_id for key, _, _ in participants],
+            related_process_roles=[role for _, role, _ in participants],
+        )
+        event_ref = raw_event_refs.get(_intrusion_raw_event_identity(event))
+        if event_ref:
+            row["event_ref"] = event_ref
+        size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":"))) + 1
+        timestamp = event.time_created.timestamp() if event.time_created else float("inf")
+        # Highest relevance and earliest evidence win when retention is full.
+        heapq.heappush(heap, (-priority, -timestamp, -matched, size, row))
+        chars += size
+        while heap and (len(heap) > INTRUSION_RELATED_EVENT_LIMIT or chars > INTRUSION_RELATED_CHAR_LIMIT):
+            chars -= heapq.heappop(heap)[3]
+    rows = sorted((item[4] for item in heap), key=lambda row: (
+        row.get("time") or "9999", row.get("source_ref") or "",
+    ))
+    scope = _intrusion_related_scope(matched, len(rows), chars, input_scan_limited)
+    return rows, scope
 
 
 def _intrusion_process_for_event(
@@ -5326,6 +5528,21 @@ def _evidence(event: EventRecord) -> dict[str, Any]:
             "Description",
             "StartModule",
             "StartFunction",
+            "SourceProcessGUID",
+            "SourceProcessGuid",
+            "SourceProcessId",
+            "SourceProcessID",
+            "SourceImage",
+            "SourceThreadId",
+            "TargetProcessGUID",
+            "TargetProcessGuid",
+            "TargetProcessId",
+            "TargetProcessID",
+            "TargetImage",
+            "GrantedAccess",
+            "CallTrace",
+            "StartAddress",
+            "NewThreadId",
             "ObjectName",
             "ObjectValueName",
             "Operation",
