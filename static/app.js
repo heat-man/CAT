@@ -2441,26 +2441,15 @@ function escapeHtml(value) {
 
 function startProgress() {
   progressStart = Date.now();
-  updateProgress(5, "파일 업로드 준비 중");
+  updateProgress(5, "분석 요청 처리 중 (0초)");
   clearInterval(progressTimer);
   progressTimer = setInterval(() => {
     const elapsed = Math.floor((Date.now() - progressStart) / 1000);
-    let percent = Math.min(88, 8 + elapsed * 2);
-    let message = "파일 업로드 중";
-    if (elapsed > 6) {
-      message = "EVTX/XML 스트리밍 파싱 및 시간 범위 필터링 중";
-      percent = Math.min(70, 25 + elapsed * 1.5);
-    }
-    if (elapsed > 20) {
-      if (agentBackend?.value === "codex_dev") {
-        message = "Codex 에이전트 보고서 생성 중";
-      } else if (agentBackend?.value === "rule") {
-        message = "규칙 기반 보고서 생성 중";
-      } else {
-        message = "LM Studio 보고서 생성 중";
-      }
-      percent = Math.min(92, 55 + elapsed * 0.8);
-    }
+    // The API returns the finished report, not live stage/progress updates.
+    // This capped animation indicates waiting; it is not a completion estimate.
+    const percent = Math.min(92, 5 + elapsed * 0.8);
+    let message = elapsed > 20 ? "서버 응답을 기다리는 중" : "분석 요청 처리 중";
+    if (elapsed >= 60) message += " · 대용량 로그나 모델 응답은 시간이 걸릴 수 있습니다";
     updateProgress(percent, `${message} (${elapsed}초)`);
   }, 500);
 }
